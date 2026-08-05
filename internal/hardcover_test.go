@@ -27,6 +27,31 @@ type transport interface {
 	http.RoundTripper
 }
 
+func TestBestHardcoverEditionUsesAudioDefault(t *testing.T) {
+	const (
+		authorID = int64(123)
+		audioID  = int64(456)
+	)
+
+	author := hardcover.ContributionsAuthorAuthors{
+		AuthorInfo: hardcover.AuthorInfo{Id: authorID},
+	}
+	defaults := hardcover.DefaultEditions{
+		Id: 789,
+		Contributions: []hardcover.DefaultEditionsContributions{{
+			Contributions: hardcover.Contributions{Author: author},
+		}},
+		Default_audio_edition: hardcover.DefaultEditionsDefault_audio_editionEditions{
+			Id: audioID,
+			Contributions: []hardcover.DefaultEditionsDefault_audio_editionEditionsContributions{{
+				Contributions: hardcover.Contributions{Author: author},
+			}},
+		},
+	}
+
+	assert.Equal(t, audioID, bestHardcoverEdition(defaults, authorID))
+}
+
 func TestGetBookDataIntegrity(t *testing.T) {
 	// The client is particularly sensitive to null values.
 	// For a given work resource, it MUST

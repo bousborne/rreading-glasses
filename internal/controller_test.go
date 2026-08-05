@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"iter"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -86,11 +87,11 @@ func TestIncrementalDenormalization(t *testing.T) {
 	}).AnyTimes()
 
 	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).Return(
-		func(yield func(int64) bool) {
-			if !yield(englishEdition.ForeignID) {
+		func(yield func(int64, error) bool) {
+			if !yield(englishEdition.ForeignID, nil) {
 				return
 			}
-			if !yield(frenchEdition.ForeignID) {
+			if !yield(frenchEdition.ForeignID, nil) {
 				return
 			}
 		},
@@ -355,7 +356,7 @@ func TestSubtitles(t *testing.T) {
 		LinkItems: []seriesWorkLinkResource{},
 	}, nil)
 
-	getter.EXPECT().GetAuthorBooks(gomock.Any(), author.ForeignID).Return(iter.Seq[int64](func(func(int64) bool) {}))
+	getter.EXPECT().GetAuthorBooks(gomock.Any(), author.ForeignID).Return(iter.Seq2[int64, error](func(func(int64, error) bool) {}))
 
 	err = ctrl.denormalizeWorks(ctx, author.ForeignID, workDupe1.ForeignID, workDupe2.ForeignID, workUnique.ForeignID)
 	require.NoError(t, err)
@@ -484,6 +485,57 @@ func TestMergedWorks(t *testing.T) {
 	require.NoError(t, json.Unmarshal(authorBytes, &author))
 
 	assert.Len(t, author.Works, 1)
+}
+
+func TestRefreshAuthorRetriesTransientFailures(t *testing.T) {
+	t.Parallel()
+
+	const (
+		authorID = int64(100)
+		bookID   = int64(200)
+		workID   = int64(300)
+	)
+
+	getter := NewMockgetter(gomock.NewController(t))
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+	ctrl.refreshRetryDelays = []time.Duration{0}
+	ctrl.denormC = make(chan edge, 10)
+
+	workBytes, err := json.Marshal(workResource{
+		ForeignID: workID,
+		Authors:   []AuthorResource{{ForeignID: authorID}},
+		Books:     []bookResource{{ForeignID: bookID}},
+	})
+	require.NoError(t, err)
+
+	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).Return(iter.Seq2[int64, error](func(yield func(int64, error) bool) {
+		yield(bookID, nil)
+	}))
+	getter.EXPECT().GetBook(gomock.Any(), bookID, gomock.Any()).Return(nil, int64(0), int64(0), statusErr(http.StatusTooManyRequests))
+	getter.EXPECT().GetBook(gomock.Any(), bookID, gomock.Any()).Return(workBytes, int64(0), int64(0), nil)
+	getter.EXPECT().GetWork(gomock.Any(), workID, gomock.Any()).Return(workBytes, int64(0), nil)
+
+	assert.True(t, ctrl.refreshAuthorOnce(t.Context(), authorID))
+}
+
+func TestRefreshAuthorKeepsFailedEnumerationPending(t *testing.T) {
+	t.Parallel()
+
+	const authorID = int64(100)
+
+	getter := NewMockgetter(gomock.NewController(t))
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+	ctrl.refreshRetryDelays = nil
+	ctrl.denormC = make(chan edge, 1)
+
+	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).Return(iter.Seq2[int64, error](func(yield func(int64, error) bool) {
+		yield(0, statusErr(http.StatusTooManyRequests))
+	}))
+
+	assert.False(t, ctrl.refreshAuthorOnce(t.Context(), authorID))
+	assert.Empty(t, ctrl.denormC)
 }
 
 func TestFuzz(t *testing.T) {

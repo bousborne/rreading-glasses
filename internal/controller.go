@@ -86,6 +86,13 @@ type Controller struct {
 	refreshG errgroup.Group
 	// refreshC collects author refreshes.
 	refreshC chan refreshAuthor
+	// refreshRetryDelays controls retries for transient upstream failures while
+	// enumerating an author's catalogue. It is a field so tests can avoid
+	// sleeping without weakening production backoff.
+	refreshRetryDelays []time.Duration
+	// authorRefreshRetryDelay controls how long an incomplete catalogue refresh
+	// waits before it is placed back on the worker queue.
+	authorRefreshRetryDelay time.Duration
 
 	// workG collects work refreshes.
 	workG errgroup.Group
@@ -118,7 +125,7 @@ type getter interface {
 	// A serialized AuthorResource is returned.
 	GetAuthor(ctx context.Context, authorID int64) ([]byte, error)
 
-	GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[int64] // Returns book/edition IDs, not works.
+	GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq2[int64, error] // Returns book/edition IDs, not works.
 
 	// GetSeries returns a list of works contained in a series. The works may
 	// not all be by the same author.
@@ -180,6 +187,9 @@ func NewController(cache cache[[]byte], getter getter, persister persister, reg 
 
 		denormC:  make(chan edge),
 		refreshC: make(chan refreshAuthor),
+
+		refreshRetryDelays:      []time.Duration{time.Second, 5 * time.Second, 15 * time.Second},
+		authorRefreshRetryDelay: time.Minute,
 	}
 	if persister != nil {
 		c.persister = persister
@@ -692,8 +702,9 @@ func (c *Controller) getAuthor(ctx context.Context, authorID int64) (ttlpair, er
 }
 
 type refreshAuthor struct {
-	id    int64
-	state []byte
+	id      int64
+	state   []byte
+	isRetry bool
 }
 
 func (c *Controller) refreshAuthor(ctx context.Context, authorID int64, cachedBytes []byte) {
@@ -705,24 +716,70 @@ func (c *Controller) refreshAuthor(ctx context.Context, authorID int64, cachedBy
 		}
 	}()
 
+	if !c.refreshAuthorOnce(ctx, authorID) {
+		Log(ctx).Warn("author refresh incomplete; keeping it pending for retry", "authorID", authorID, "retryIn", c.authorRefreshRetryDelay.String())
+		go func() {
+			timer := time.NewTimer(c.authorRefreshRetryDelay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+
+			select {
+			case <-ctx.Done():
+			case c.refreshC <- refreshAuthor{id: authorID, state: cachedBytes, isRetry: true}:
+			}
+		}()
+		return
+	}
+
+	c.denormC <- edge{kind: refreshDone, parentID: authorID}
+}
+
+// refreshAuthorOnce fetches one complete snapshot of an author's catalogue.
+// It returns false when an upstream failure made the snapshot incomplete. A
+// partial snapshot is still denormalized so successful work is not discarded,
+// but the persisted refresh marker is retained until a later attempt succeeds.
+func (c *Controller) refreshAuthorOnce(ctx context.Context, authorID int64) bool {
 	Log(ctx).Info("fetching all works for author", "authorID", authorID)
 
 	n := 0
 	start := time.Now()
 	workIDSToDenormalize := []int64{}
+	complete := true
 
-	for bookID := range c.getter.GetAuthorBooks(ctx, authorID) {
+	for bookID, listErr := range c.getter.GetAuthorBooks(ctx, authorID) {
+		if listErr != nil {
+			Log(ctx).Warn("problem enumerating books for author", "authorID", authorID, "err", listErr)
+			complete = false
+			break
+		}
 		if n > 1000 {
 			Log(ctx).Warn("found too many editions", "authorID", authorID)
 			break // Some authors (e.g. Wikipedia) have an obscene number of works. Give up.
 		}
-		bookBytes, _, err := c.GetBook(ctx, bookID)
+
+		var w workResource
+		err := c.retryRefreshCall(ctx, func() error {
+			bookBytes, _, err := c.GetBook(ctx, bookID)
+			if err != nil {
+				return err
+			}
+			if err := json.Unmarshal(bookBytes, &w); err != nil {
+				_ = c.cache.Expire(ctx, BookKey(bookID))
+				return fmt.Errorf("unmarshaling book %d: %w", bookID, err)
+			}
+			return nil
+		})
 		if err != nil {
 			Log(ctx).Warn("problem getting book for author", "authorID", authorID, "bookID", bookID, "err", err)
+			if ctx.Err() != nil || retryableRefreshError(ctx, err) {
+				complete = false
+			}
 			continue
 		}
-		var w workResource
-		_ = json.Unmarshal(bookBytes, &w)
 
 		if len(w.Authors) > 0 && w.Authors[0].ForeignID != authorID {
 			Log(ctx).Debug("skipping edition due to author mismatch", "authorID", authorID, "got", w.Authors[0].ForeignID)
@@ -730,8 +787,17 @@ func (c *Controller) refreshAuthor(ctx context.Context, authorID int64, cachedBy
 		}
 
 		workID := w.ForeignID
-		if _, _, err := c.GetWork(ctx, workID); err == nil { // Ensure fetched before denormalizing.
+		err = c.retryRefreshCall(ctx, func() error {
+			_, _, err := c.GetWork(ctx, workID)
+			return err
+		})
+		if err == nil { // Ensure fetched before denormalizing.
 			workIDSToDenormalize = append(workIDSToDenormalize, workID)
+		} else {
+			Log(ctx).Warn("problem getting work for author", "authorID", authorID, "bookID", bookID, "workID", workID, "err", err)
+			if ctx.Err() != nil || retryableRefreshError(ctx, err) {
+				complete = false
+			}
 		}
 		n++
 	}
@@ -742,8 +808,43 @@ func (c *Controller) refreshAuthor(ctx context.Context, authorID int64, cachedBy
 	if len(workIDSToDenormalize) > 0 {
 		c.denormC <- edge{kind: authorEdge, parentID: authorID, childIDs: newSet(workIDSToDenormalize...)}
 	}
-	c.denormC <- edge{kind: refreshDone, parentID: authorID}
-	Log(ctx).Info("fetched all works for author", "authorID", authorID, "count", len(workIDSToDenormalize), "duration", time.Since(start).String())
+	Log(ctx).Info("finished author refresh attempt", "authorID", authorID, "count", len(workIDSToDenormalize), "complete", complete, "duration", time.Since(start).String())
+	return complete
+}
+
+func (c *Controller) retryRefreshCall(ctx context.Context, call func() error) error {
+	err := call()
+	for _, delay := range c.refreshRetryDelays {
+		if err == nil || !retryableRefreshError(ctx, err) {
+			return err
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+		err = call()
+	}
+	return err
+}
+
+func retryableRefreshError(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+
+	var status statusErr
+	if !errors.As(err, &status) {
+		// Network and malformed-response errors do not carry an HTTP status and
+		// are generally safe to retry during a background refresh.
+		return true
+	}
+
+	code := status.Status()
+	return code == http.StatusRequestTimeout || code == http.StatusTooEarly || code == http.StatusTooManyRequests || code >= 500
 }
 
 // Run is responsible for denormalizing data and handling our worker pools.
@@ -780,7 +881,9 @@ func (c *Controller) Run(ctx context.Context) {
 	go func() {
 		ctx := context.WithValue(ctx, middleware.RequestIDKey, "refresh")
 		for r := range refreshes {
-			c.metrics.refreshWaitingAdd(1)
+			if !r.isRetry {
+				c.metrics.refreshWaitingAdd(1)
+			}
 			c.refreshG.Go(func() error {
 				c.refreshAuthor(ctx, r.id, r.state)
 				return nil
