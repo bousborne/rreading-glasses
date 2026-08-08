@@ -1002,6 +1002,10 @@ func (c *Controller) denormalizeEditions(ctx context.Context, workID int64, book
 		}
 	}
 
+	if preferred := preferredDisplayEdition(work.Books); preferred != nil {
+		work.BestBookID = preferred.ForeignID
+	}
+
 	buf := _buffers.Get()
 	defer buf.Free()
 	neww := newETagWriter()
@@ -1094,6 +1098,25 @@ func (c *Controller) denormalizeWorks(ctx context.Context, authorID int64, workI
 		} else {
 			author.Works = slices.Insert(author.Works, idx, work) // Insert.
 		}
+	}
+
+	var aliases map[int64]int64
+	author.Works, aliases = mergeDuplicateFormatWorks(author.Works)
+	for aliasID, canonicalID := range aliases {
+		idx, found := slices.BinarySearchFunc(author.Works, canonicalID, func(w workResource, id int64) int {
+			return cmp.Compare(w.ForeignID, id)
+		})
+		if !found {
+			continue
+		}
+
+		mergedBytes, marshalErr := sonic.ConfigStd.Marshal(author.Works[idx])
+		if marshalErr != nil {
+			continue
+		}
+		c.cache.Set(ctx, WorkKey(canonicalID), mergedBytes, fuzz(_workTTL, 1.5))
+		c.cache.Set(ctx, WorkKey(aliasID), mergedBytes, fuzz(_workTTL, 1.5))
+		Log(ctx).Info("merged high-confidence format-split works", "canonicalWorkID", canonicalID, "aliasWorkID", aliasID)
 	}
 
 	author.Series = []SeriesResource{}
