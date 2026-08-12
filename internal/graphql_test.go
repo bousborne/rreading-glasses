@@ -433,7 +433,7 @@ func TestBatchingRespectsBatchSize(t *testing.T) {
 	errs := make([]error, numQueries)
 	for i := 0; i < numQueries; i++ {
 		wg.Add(1)
-		i := i
+
 		go func() {
 			defer wg.Done()
 			_, errs[i] = gr.GetBook(t.Context(), gql, int64(i+1))
