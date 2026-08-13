@@ -636,6 +636,11 @@ func (*Handler) error(w http.ResponseWriter, err error) {
 	if errors.As(err, &s) {
 		status = s.Status()
 	}
+	if status == http.StatusTooManyRequests {
+		// Readarr understands this header and can back off instead of treating
+		// an exhausted retry budget as a generic metadata-server failure.
+		w.Header().Set("Retry-After", "30")
+	}
 	http.Error(w, err.Error(), status)
 }
 

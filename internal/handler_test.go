@@ -1,10 +1,21 @@
 package internal
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
+
+func TestErrorReturnsRateLimitStatusAndRetryAfter(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	(&Handler{}).error(recorder, errors.Join(errors.New("upstream rate limited"), statusErr(http.StatusTooManyRequests)))
+
+	assert.Equal(t, http.StatusTooManyRequests, recorder.Code)
+	assert.Equal(t, "30", recorder.Header().Get("Retry-After"))
+}
 
 func TestPathToID(t *testing.T) {
 	tests := []struct {

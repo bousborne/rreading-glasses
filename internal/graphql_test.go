@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -459,11 +460,92 @@ func TestBatchingRespectsBatchSize(t *testing.T) {
 	}
 }
 
+func TestBatchingAllowsOnlyOneUpstreamRequestInFlight(t *testing.T) {
+	const numQueries = 3
+
+	started := make(chan struct{}, numQueries)
+	release := make(chan struct{}, numQueries)
+	client := &http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			started <- struct{}{}
+			<-release
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"data": {}}`)),
+			}, nil
+		}),
+	}
+
+	gql, err := NewBatchedGraphQLClient("https://foo.com", client, 5*time.Millisecond, 1, nil)
+	require.NoError(t, err)
+
+	defer close(release)
+	wg := sync.WaitGroup{}
+	wg.Add(numQueries)
+	for i := 0; i < numQueries; i++ {
+		go func(id int64) {
+			defer wg.Done()
+			_, _ = gr.GetBook(t.Context(), gql, id)
+		}(int64(i + 1))
+	}
+
+	for i := 0; i < numQueries; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("request %d did not start", i+1)
+		}
+
+		select {
+		case <-started:
+			t.Fatalf("request %d started while request %d was still in flight", i+2, i+1)
+		case <-time.After(20 * time.Millisecond):
+		}
+
+		release <- struct{}{}
+	}
+
+	wg.Wait()
+}
+
+func TestBatchingRetriesRateLimitedRequest(t *testing.T) {
+	var calls atomic.Int32
+	client := &http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				return &http.Response{
+					StatusCode: http.StatusTooManyRequests,
+					Body:       io.NopCloser(strings.NewReader(`{"data": null}`)),
+				}, nil
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"data": {}}`)),
+			}, nil
+		}),
+	}
+
+	gql, err := NewBatchedGraphQLClient("https://foo.com", client, time.Millisecond, 1, nil)
+	require.NoError(t, err)
+	batched := gql.(*batchedgqlclient)
+	batched.retryBase = time.Millisecond
+	batched.maxRetries = 1
+
+	_, err = gr.GetBook(t.Context(), gql, 1)
+	assert.NoError(t, err)
+	assert.Equal(t, int32(2), calls.Load())
+}
+
 func TestGQLStatusCode(t *testing.T) {
-	err := &gqlerror.Error{Message: "womp"}
+	var err error = &gqlerror.Error{Message: "womp"}
 	assert.ErrorIs(t, err, gqlStatusErr(err))
 
 	err = &gqlerror.Error{Message: "Request failed with status code 403"}
 	err403 := statusErr(403)
 	assert.ErrorAs(t, gqlStatusErr(err), &err403)
+
+	err = errors.New(`returned error 429: {"data":null}`)
+	err429 := statusErr(http.StatusTooManyRequests)
+	assert.ErrorAs(t, gqlStatusErr(err), &err429)
 }

@@ -29,10 +29,13 @@ import (
 type batchedgqlclient struct {
 	mu sync.Mutex
 
-	batchSize int            // batchSize is the max number of queries per batch.
-	queue     []batchedQuery // queue contains spillover in cases where we've accumulated more queries than our batch size allows.
-	every     time.Duration  // every controls how often requests are flushed.
-	metrics   *gqlMetrics    // metrics tracks batches and queries sent.
+	batchSize      int            // batchSize is the max number of queries per batch.
+	queue          []batchedQuery // queue contains spillover in cases where we've accumulated more queries than our batch size allows.
+	every          time.Duration  // every controls how often requests are flushed.
+	maxRetries     int            // maxRetries bounds retries for an upstream 429 response.
+	retryBase      time.Duration  // retryBase controls exponential backoff after an upstream 429 response.
+	requestTimeout time.Duration  // requestTimeout bounds a batch, including rate-limit backoff.
+	metrics        *gqlMetrics    // metrics tracks batches and queries sent.
 
 	wrapped graphql.Client
 }
@@ -43,11 +46,14 @@ func NewBatchedGraphQLClient(url string, client *http.Client, every time.Duratio
 	wrapped := graphql.NewClient(url, client)
 
 	c := &batchedgqlclient{
-		batchSize: batchSize,
-		wrapped:   wrapped,
-		queue:     []batchedQuery{},
-		metrics:   newGQLMetrics(reg),
-		every:     every,
+		batchSize:      batchSize,
+		wrapped:        wrapped,
+		queue:          []batchedQuery{},
+		metrics:        newGQLMetrics(reg),
+		every:          every,
+		maxRetries:     4,
+		retryBase:      5 * time.Second,
+		requestTimeout: 2 * time.Minute,
 	}
 
 	go func() {
@@ -79,32 +85,33 @@ func NewBatchedGraphQLClient(url string, client *http.Client, every time.Duratio
 	return c, nil
 }
 
-// flush drains every pending batchedQuery off the queue and executes it.
+// flush pops the oldest batchedQuery off the queue and executes it.
 // Individualized errors are returned to listeners if possible, so one query
 // can fail without the entire batch failing. The whole batch can still fail in
 // other cases, e.g. 4XX response codes.
 //
-// All queued batches are drained each tick (rather than one per tick) so that
-// a smaller batch size — used to respect an upstream cap on top-level fields
-// per request, see https://github.com/blampe/rreading-glasses/issues/574 —
-// does not proportionally reduce throughput. Each batch fires in its own
-// goroutine, exactly as a single batch did before.
+// Only one batch is sent per tick, and fire runs synchronously, so there can be
+// at most one upstream GraphQL request in flight. This deliberately trades
+// burst throughput for predictable pressure on Hardcover's rate limiter.
 func (c *batchedgqlclient) flush(ctx context.Context) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	c.metrics.batchesWaitingSet(len(c.queue))
 
-	for len(c.queue) > 0 {
-		batch := c.queue[0]
-		c.queue = c.queue[1:]
-		c.fire(ctx, batch)
+	if len(c.queue) == 0 {
+		c.mu.Unlock()
+		return
 	}
+
+	batch := c.queue[0]
+	c.queue = c.queue[1:]
+	c.mu.Unlock()
+
+	c.fire(ctx, batch)
 }
 
-// fire executes a single batch as one GraphQL request. It is called under
-// c.mu; the upstream HTTP call happens in a spawned goroutine that does not
-// touch c.mu-protected state.
+// fire executes a single batch as one GraphQL request. Rate-limited requests
+// are retried with bounded exponential backoff before the error is returned to
+// callers.
 func (c *batchedgqlclient) fire(ctx context.Context, batch batchedQuery) {
 	c.metrics.batchesSentInc()
 	c.metrics.queriesSentAdd(int64(len(batch.subscribers)))
@@ -112,62 +119,93 @@ func (c *batchedgqlclient) fire(ctx context.Context, batch batchedQuery) {
 	query, vars, err := batch.qb.build()
 	if err != nil {
 		Log(ctx).Error("unable to build query", "err", err)
+		for _, sub := range batch.subscribers {
+			sub.respC <- err
+		}
 		return
 	}
 
-	data := map[string]any{}
 	req := &graphql.Request{
 		Query:     query,
 		Variables: vars,
 		OpName:    batch.qb.op.Name.Value,
 	}
-	resp := &graphql.Response{
-		Data: &data,
+
+	ctx, cancel := context.WithTimeout(ctx, c.requestTimeout)
+	defer cancel()
+
+	var data map[string]any
+	var resp *graphql.Response
+	var requestErr error
+
+retryLoop:
+	for attempt := 0; ; attempt++ {
+		data = map[string]any{}
+		resp = &graphql.Response{Data: &data}
+		requestErr = c.wrapped.MakeRequest(ctx, req, resp)
+		if requestErr != nil {
+			requestErr = gqlStatusErr(requestErr)
+		}
+
+		if requestErr == nil || len(resp.Errors) > 0 ||
+			!errors.Is(requestErr, statusErr(http.StatusTooManyRequests)) ||
+			attempt >= c.maxRetries {
+			break
+		}
+
+		delay := c.retryBase * time.Duration(1<<attempt)
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+
+		Log(ctx).Warn("Hardcover rate limited batched query; retrying",
+			"attempt", attempt+1,
+			"maxRetries", c.maxRetries,
+			"delay", delay,
+			"count", len(batch.subscribers))
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			requestErr = errors.Join(requestErr, ctx.Err())
+			break retryLoop
+		case <-timer.C:
+		}
 	}
 
-	// Issue the request in a separate goroutine so we can continue to
-	// accumulate queries without needing to wait for the network call.
-	go func(batch batchedQuery) {
-		ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-		defer cancel()
-
-		err := c.wrapped.MakeRequest(ctx, req, resp)
-
-		// Extract any field-level errors, and return them to their
-		// subscribers. We can ignore the top-level err in this case, because
-		// it's just the wrapped version of our response errors.
-		if resp != nil && len(resp.Errors) > 0 {
-			for _, e := range resp.Errors {
-				sub, ok := batch.subscribers[e.Path.String()]
-				if !ok {
-					continue
-				}
-				sub.respC <- gqlStatusErr(e)
-				// Remove our subscriber because we already responded.
-				delete(batch.subscribers, e.Path.String())
-			}
-		} else if err != nil {
-			// For everything else return the status code to all our subscribers.
-			Log(ctx).Warn("batched query error", "count", len(batch.subscribers), "err", err, "resp.Errors", resp.Errors)
-			for _, sub := range batch.subscribers {
-				sub.respC <- gqlStatusErr(err)
-			}
-			return
-		}
-
-		for id, sub := range batch.subscribers {
-			// TODO: missing response.
-			byt, err := json.Marshal(map[string]any{
-				sub.field: data[id],
-			})
-			if err != nil {
-				sub.respC <- err
+	// Extract any field-level errors, and return them to their subscribers.
+	// We can ignore the top-level error in this case, because it is just the
+	// wrapped version of our response errors.
+	if resp != nil && len(resp.Errors) > 0 {
+		for _, e := range resp.Errors {
+			sub, ok := batch.subscribers[e.Path.String()]
+			if !ok {
 				continue
 			}
-
-			sub.respC <- sonic.ConfigStd.Unmarshal(byt, &sub.resp.Data)
+			sub.respC <- gqlStatusErr(e)
+			delete(batch.subscribers, e.Path.String())
 		}
-	}(batch)
+	} else if requestErr != nil {
+		Log(ctx).Warn("batched query error", "count", len(batch.subscribers), "err", requestErr)
+		for _, sub := range batch.subscribers {
+			sub.respC <- requestErr
+		}
+		return
+	}
+
+	for id, sub := range batch.subscribers {
+		// TODO: missing response.
+		byt, err := json.Marshal(map[string]any{
+			sub.field: data[id],
+		})
+		if err != nil {
+			sub.respC <- err
+			continue
+		}
+
+		sub.respC <- sonic.ConfigStd.Unmarshal(byt, &sub.resp.Data)
+	}
 }
 
 // MakeRequest implements graphql.Client.
@@ -243,12 +281,19 @@ type subscription struct {
 // The error is returned unchanged if it doesn't include a status code.
 func gqlStatusErr(err error) error {
 	errStr := err.Error()
-	idx := strings.Index(errStr, "Request failed with status code")
-	if idx == -1 {
-		return err
+	for _, marker := range []string{"Request failed with status code", "returned error"} {
+		idx := strings.Index(errStr, marker)
+		if idx == -1 {
+			continue
+		}
+
+		code, parseErr := pathToID(errStr[idx:])
+		if parseErr == nil {
+			return errors.Join(err, statusErr(code))
+		}
 	}
-	code, _ := pathToID(errStr[idx:])
-	return errors.Join(err, statusErr(code))
+
+	return err
 }
 
 // queryBuilder accumulates queries into one query with multiple fields so they
