@@ -250,13 +250,17 @@ func (v *DefaultEditionsContributions) __premarshalJSON() (*__premarshalDefaultE
 //
 // columns and relationships of "editions"
 type DefaultEditionsDefault_audio_editionEditions struct {
-	Id int64 `json:"id"`
+	Id      int64 `json:"id"`
+	Book_id int64 `json:"book_id"`
 	// An array relationship
 	Contributions []DefaultEditionsDefault_audio_editionEditionsContributions `json:"contributions"`
 }
 
 // GetId returns DefaultEditionsDefault_audio_editionEditions.Id, and is useful for accessing the field via an interface.
 func (v *DefaultEditionsDefault_audio_editionEditions) GetId() int64 { return v.Id }
+
+// GetBook_id returns DefaultEditionsDefault_audio_editionEditions.Book_id, and is useful for accessing the field via an interface.
+func (v *DefaultEditionsDefault_audio_editionEditions) GetBook_id() int64 { return v.Book_id }
 
 // GetContributions returns DefaultEditionsDefault_audio_editionEditions.Contributions, and is useful for accessing the field via an interface.
 func (v *DefaultEditionsDefault_audio_editionEditions) GetContributions() []DefaultEditionsDefault_audio_editionEditionsContributions {
@@ -333,13 +337,17 @@ func (v *DefaultEditionsDefault_audio_editionEditionsContributions) __premarshal
 //
 // columns and relationships of "editions"
 type DefaultEditionsDefault_cover_editionEditions struct {
-	Id int64 `json:"id"`
+	Id      int64 `json:"id"`
+	Book_id int64 `json:"book_id"`
 	// An array relationship
 	Contributions []DefaultEditionsDefault_cover_editionEditionsContributions `json:"contributions"`
 }
 
 // GetId returns DefaultEditionsDefault_cover_editionEditions.Id, and is useful for accessing the field via an interface.
 func (v *DefaultEditionsDefault_cover_editionEditions) GetId() int64 { return v.Id }
+
+// GetBook_id returns DefaultEditionsDefault_cover_editionEditions.Book_id, and is useful for accessing the field via an interface.
+func (v *DefaultEditionsDefault_cover_editionEditions) GetBook_id() int64 { return v.Book_id }
 
 // GetContributions returns DefaultEditionsDefault_cover_editionEditions.Contributions, and is useful for accessing the field via an interface.
 func (v *DefaultEditionsDefault_cover_editionEditions) GetContributions() []DefaultEditionsDefault_cover_editionEditionsContributions {
@@ -416,13 +424,17 @@ func (v *DefaultEditionsDefault_cover_editionEditionsContributions) __premarshal
 //
 // columns and relationships of "editions"
 type DefaultEditionsDefault_ebook_editionEditions struct {
-	Id int64 `json:"id"`
+	Id      int64 `json:"id"`
+	Book_id int64 `json:"book_id"`
 	// An array relationship
 	Contributions []DefaultEditionsDefault_ebook_editionEditionsContributions `json:"contributions"`
 }
 
 // GetId returns DefaultEditionsDefault_ebook_editionEditions.Id, and is useful for accessing the field via an interface.
 func (v *DefaultEditionsDefault_ebook_editionEditions) GetId() int64 { return v.Id }
+
+// GetBook_id returns DefaultEditionsDefault_ebook_editionEditions.Book_id, and is useful for accessing the field via an interface.
+func (v *DefaultEditionsDefault_ebook_editionEditions) GetBook_id() int64 { return v.Book_id }
 
 // GetContributions returns DefaultEditionsDefault_ebook_editionEditions.Contributions, and is useful for accessing the field via an interface.
 func (v *DefaultEditionsDefault_ebook_editionEditions) GetContributions() []DefaultEditionsDefault_ebook_editionEditionsContributions {
@@ -499,13 +511,17 @@ func (v *DefaultEditionsDefault_ebook_editionEditionsContributions) __premarshal
 //
 // columns and relationships of "editions"
 type DefaultEditionsDefault_physical_editionEditions struct {
-	Id int64 `json:"id"`
+	Id      int64 `json:"id"`
+	Book_id int64 `json:"book_id"`
 	// An array relationship
 	Contributions []DefaultEditionsDefault_physical_editionEditionsContributions `json:"contributions"`
 }
 
 // GetId returns DefaultEditionsDefault_physical_editionEditions.Id, and is useful for accessing the field via an interface.
 func (v *DefaultEditionsDefault_physical_editionEditions) GetId() int64 { return v.Id }
+
+// GetBook_id returns DefaultEditionsDefault_physical_editionEditions.Book_id, and is useful for accessing the field via an interface.
+func (v *DefaultEditionsDefault_physical_editionEditions) GetBook_id() int64 { return v.Book_id }
 
 // GetContributions returns DefaultEditionsDefault_physical_editionEditions.Contributions, and is useful for accessing the field via an interface.
 func (v *DefaultEditionsDefault_physical_editionEditions) GetContributions() []DefaultEditionsDefault_physical_editionEditionsContributions {
@@ -582,11 +598,87 @@ func (v *DefaultEditionsDefault_physical_editionEditionsContributions) __premars
 //
 // columns and relationships of "editions"
 type DefaultEditionsFallbackEditions struct {
-	Id int64 `json:"id"`
+	Id      int64 `json:"id"`
+	Book_id int64 `json:"book_id"`
+	// An array relationship
+	Contributions []DefaultEditionsFallbackEditionsContributions `json:"contributions"`
 }
 
 // GetId returns DefaultEditionsFallbackEditions.Id, and is useful for accessing the field via an interface.
 func (v *DefaultEditionsFallbackEditions) GetId() int64 { return v.Id }
+
+// GetBook_id returns DefaultEditionsFallbackEditions.Book_id, and is useful for accessing the field via an interface.
+func (v *DefaultEditionsFallbackEditions) GetBook_id() int64 { return v.Book_id }
+
+// GetContributions returns DefaultEditionsFallbackEditions.Contributions, and is useful for accessing the field via an interface.
+func (v *DefaultEditionsFallbackEditions) GetContributions() []DefaultEditionsFallbackEditionsContributions {
+	return v.Contributions
+}
+
+// DefaultEditionsFallbackEditionsContributions includes the requested fields of the GraphQL type contributions.
+// The GraphQL type's documentation follows.
+//
+// columns and relationships of "contributions"
+type DefaultEditionsFallbackEditionsContributions struct {
+	Contributions `json:"-"`
+}
+
+// GetContribution returns DefaultEditionsFallbackEditionsContributions.Contribution, and is useful for accessing the field via an interface.
+func (v *DefaultEditionsFallbackEditionsContributions) GetContribution() string {
+	return v.Contributions.Contribution
+}
+
+// GetAuthor returns DefaultEditionsFallbackEditionsContributions.Author, and is useful for accessing the field via an interface.
+func (v *DefaultEditionsFallbackEditionsContributions) GetAuthor() ContributionsAuthorAuthors {
+	return v.Contributions.Author
+}
+
+func (v *DefaultEditionsFallbackEditionsContributions) UnmarshalJSON(b []byte) error {
+
+	if string(b) == "null" {
+		return nil
+	}
+
+	var firstPass struct {
+		*DefaultEditionsFallbackEditionsContributions
+		graphql.NoUnmarshalJSON
+	}
+	firstPass.DefaultEditionsFallbackEditionsContributions = v
+
+	err := json.Unmarshal(b, &firstPass)
+	if err != nil {
+		return err
+	}
+
+	err = json.Unmarshal(
+		b, &v.Contributions)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+type __premarshalDefaultEditionsFallbackEditionsContributions struct {
+	Contribution string `json:"contribution"`
+
+	Author ContributionsAuthorAuthors `json:"author"`
+}
+
+func (v *DefaultEditionsFallbackEditionsContributions) MarshalJSON() ([]byte, error) {
+	premarshaled, err := v.__premarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(premarshaled)
+}
+
+func (v *DefaultEditionsFallbackEditionsContributions) __premarshalJSON() (*__premarshalDefaultEditionsFallbackEditionsContributions, error) {
+	var retval __premarshalDefaultEditionsFallbackEditionsContributions
+
+	retval.Contribution = v.Contributions.Contribution
+	retval.Author = v.Contributions.Author
+	return &retval, nil
+}
 
 // EditionInfo includes the GraphQL fields of editions requested by the fragment EditionInfo.
 // The GraphQL type's documentation follows.
@@ -2256,30 +2348,38 @@ fragment DefaultEditions on books {
 	}
 	default_audio_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
 	default_physical_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
 	default_cover_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
 	default_ebook_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
-	fallback: editions(order_by: {id:desc}, limit: 1) {
+	fallback: editions(order_by: [{score:desc_nulls_last},{users_read_count:desc},{id:asc}], limit: 1) {
 		id
+		book_id
+		contributions {
+			... Contributions
+		}
 	}
 }
 `
@@ -2377,30 +2477,38 @@ fragment DefaultEditions on books {
 	}
 	default_audio_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
 	default_physical_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
 	default_cover_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
 	default_ebook_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
-	fallback: editions(order_by: {id:desc}, limit: 1) {
+	fallback: editions(order_by: [{score:desc_nulls_last},{users_read_count:desc},{id:asc}], limit: 1) {
 		id
+		book_id
+		contributions {
+			... Contributions
+		}
 	}
 }
 fragment Contributions on contributions {
@@ -2594,30 +2702,38 @@ fragment DefaultEditions on books {
 	}
 	default_audio_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
 	default_physical_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
 	default_cover_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
 	default_ebook_edition {
 		id
+		book_id
 		contributions {
 			... Contributions
 		}
 	}
-	fallback: editions(order_by: {id:desc}, limit: 1) {
+	fallback: editions(order_by: [{score:desc_nulls_last},{users_read_count:desc},{id:asc}], limit: 1) {
 		id
+		book_id
+		contributions {
+			... Contributions
+		}
 	}
 }
 fragment Contributions on contributions {

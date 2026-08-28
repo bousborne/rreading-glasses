@@ -29,6 +29,10 @@ func AsContributions(c any) []Contributions {
 		for _, cc := range s {
 			result = append(result, cc.Contributions)
 		}
+	case []DefaultEditionsFallbackEditionsContributions:
+		for _, cc := range s {
+			result = append(result, cc.Contributions)
+		}
 	case []GetAuthorEditionsAuthors_by_pkAuthorsContributions:
 		for _, cc := range s {
 			result = append(result, cc.Contributions)

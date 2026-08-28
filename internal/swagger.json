@@ -278,6 +278,9 @@
                 "AverageRating": {
                     "type": "number"
                 },
+                "CacheSchemaVersion": {
+                    "type": "integer"
+                },
                 "Description": {
                     "type": "string"
                 },
@@ -419,6 +422,10 @@
                 "Language": {
                     "type": "string"
                 },
+                "MediaType": {
+                    "description": "0 unknown/physical, 1 ebook, 2 audiobook.",
+                    "type": "integer"
+                },
                 "NumPages": {
                     "type": "integer"
                 },
@@ -523,6 +530,21 @@
                         "$ref": "#/definitions/internal.bookResource"
                     }
                 },
+                "CacheSchemaVersion": {
+                    "type": "integer"
+                },
+                "DefaultAudioEditionId": {
+                    "type": "integer"
+                },
+                "DefaultCoverEditionId": {
+                    "type": "integer"
+                },
+                "DefaultEbookEditionId": {
+                    "type": "integer"
+                },
+                "DefaultPhysicalEditionId": {
+                    "type": "integer"
+                },
                 "ForeignId": {
                     "type": "integer"
                 },
@@ -539,6 +561,13 @@
                 "KCA": {
                     "description": "New fields",
                     "type": "string"
+                },
+                "ProviderEditionIds": {
+                    "description": "ProviderEditionIDs is the authoritative current edition membership from\nproviders which can return a complete work-edition relationship. Older\nclients safely ignore this additive field.",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
                 },
                 "RatingCount": {
                     "type": "integer"

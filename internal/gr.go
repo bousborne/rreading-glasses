@@ -34,6 +34,8 @@ type GRGetter struct {
 
 var _ getter = (*GRGetter)(nil)
 
+func (*GRGetter) workCacheSchemaVersion() int { return workCacheSchemaVersion }
+
 // _grkey key has been public for years.
 // https://github.com/search?q=whFzJP3Ud0gZsAdyXxSr7T&type=code
 var _grkey = "T7rSxXydAsZg0dU3PJzFhw"
@@ -172,6 +174,13 @@ func (g *GRGetter) GetWork(ctx context.Context, workID int64, saveEditions editi
 		return nil, 0, errNotFound
 	}
 	workBytes, ttl, ok := g.cache.GetWithTTL(ctx, WorkKey(workID))
+	if ok && !hasCurrentWorkCacheSchema(workBytes, g.workCacheSchemaVersion()) {
+		Log(ctx).Info("refreshing legacy GR work payload", "workID", workID)
+		if err := g.cache.Expire(ctx, WorkKey(workID)); err != nil {
+			Log(ctx).Warn("unable to expire legacy GR work payload", "workID", workID, "err", err)
+		}
+		workBytes, ttl, ok = nil, 0, false
+	}
 	if ok && ttl > 0 {
 		return workBytes, 0, nil
 	}
@@ -219,8 +228,16 @@ func (g *GRGetter) GetWork(ctx context.Context, workID int64, saveEditions editi
 
 // GetBook fetches a book (edition) from GR.
 func (g *GRGetter) GetBook(ctx context.Context, bookID int64, saveEditions editionsCallback) (_ []byte, workID, authorID int64, _ error) {
-	if workBytes, ttl, ok := g.cache.GetWithTTL(ctx, BookKey(bookID)); ok && ttl > 0 {
-		return workBytes, 0, 0, nil
+	if workBytes, ttl, ok := g.cache.GetWithTTL(ctx, BookKey(bookID)); ok {
+		if hasCurrentWorkCacheSchema(workBytes, g.workCacheSchemaVersion()) && ttl > 0 {
+			return workBytes, 0, 0, nil
+		}
+		if !hasCurrentWorkCacheSchema(workBytes, g.workCacheSchemaVersion()) {
+			Log(ctx).Info("refreshing legacy GR edition payload", "bookID", bookID)
+			if err := g.cache.Expire(ctx, BookKey(bookID)); err != nil {
+				Log(ctx).Warn("unable to expire legacy GR edition payload", "bookID", bookID, "err", err)
+			}
+		}
 	}
 
 	Log(ctx).Debug("getting book", "bookID", bookID)
@@ -303,6 +320,7 @@ func mapToWorkResource(book gr.BookInfo, work gr.GetBookGetBookByLegacyIdBookWor
 		bookDescription = "N/A" // Must be set?
 	}
 
+	mediaType := classifyMediaType(book.Details.Format)
 	bookRsc := bookResource{
 		KCA:                book.Id,
 		ForeignID:          book.LegacyId,
@@ -317,7 +335,8 @@ func mapToWorkResource(book gr.BookInfo, work gr.GetBookGetBookByLegacyIdBookWor
 		EditionInformation: "",                     // TODO: Is this used anywhere?
 		Publisher:          book.Details.Publisher, // TODO: Ignore books without publishers?
 		ImageURL:           book.ImageUrl,
-		IsEbook:            book.Details.Format == "Kindle Edition", // TODO: Flush this out.
+		IsEbook:            mediaType == mediaTypeEbook,
+		MediaType:          mediaType,
 		NumPages:           book.Details.NumPages,
 		RatingCount:        book.Stats.RatingsCount,
 		RatingSum:          book.Stats.RatingsSum,
@@ -343,26 +362,28 @@ func mapToWorkResource(book gr.BookInfo, work gr.GetBookGetBookByLegacyIdBookWor
 	authorDescription = html.UnescapeString(_stripTags.Sanitize(authorDescription))
 
 	authorRsc := AuthorResource{
-		KCA:         author.Id,
-		Name:        author.Name,
-		ForeignID:   author.LegacyId,
-		URL:         author.WebUrl,
-		ImageURL:    author.ProfileImageUrl,
-		Description: authorDescription,
-		Series:      series,
+		CacheSchemaVersion: workCacheSchemaVersion,
+		KCA:                author.Id,
+		Name:               author.Name,
+		ForeignID:          author.LegacyId,
+		URL:                author.WebUrl,
+		ImageURL:           author.ProfileImageUrl,
+		Description:        authorDescription,
+		Series:             series,
 	}
 
 	workRsc := workResource{
-		Title:        work.BestBook.TitlePrimary,
-		FullTitle:    work.BestBook.Title,
-		ShortTitle:   work.BestBook.TitlePrimary,
-		KCA:          work.Id,
-		ForeignID:    work.LegacyId,
-		URL:          work.Details.WebUrl,
-		Series:       series,
-		Genres:       genres,
-		RelatedWorks: []int{},
-		BestBookID:   work.BestBook.LegacyId,
+		CacheSchemaVersion: workCacheSchemaVersion,
+		Title:              work.BestBook.TitlePrimary,
+		FullTitle:          work.BestBook.Title,
+		ShortTitle:         work.BestBook.TitlePrimary,
+		KCA:                work.Id,
+		ForeignID:          work.LegacyId,
+		URL:                work.Details.WebUrl,
+		Series:             series,
+		Genres:             genres,
+		RelatedWorks:       []int{},
+		BestBookID:         work.BestBook.LegacyId,
 	}
 
 	if work.Details.PublicationTime != 0 {

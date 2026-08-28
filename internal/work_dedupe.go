@@ -2,6 +2,7 @@ package internal
 
 import (
 	"cmp"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -84,9 +85,21 @@ func combineWorks(canonical, duplicate workResource) workResource {
 	slices.SortFunc(canonical.Books, func(a, b bookResource) int {
 		return cmp.Compare(a.ForeignID, b.ForeignID)
 	})
-	if preferred := preferredDisplayEdition(canonical.Books); preferred != nil {
-		canonical.BestBookID = preferred.ForeignID
+	mergeProviderDefaultEditions(&canonical, duplicate)
+	membership := make(map[int64]struct{}, len(canonical.ProviderEditionIDs)+len(duplicate.ProviderEditionIDs))
+	for _, editionID := range canonical.ProviderEditionIDs {
+		if editionID != 0 {
+			membership[editionID] = struct{}{}
+		}
 	}
+	for _, editionID := range duplicate.ProviderEditionIDs {
+		if editionID != 0 {
+			membership[editionID] = struct{}{}
+		}
+	}
+	canonical.ProviderEditionIDs = slices.Collect(maps.Keys(membership))
+	slices.Sort(canonical.ProviderEditionIDs)
+	stabilizeLegacyBestBookID(&canonical)
 
 	for _, series := range duplicate.Series {
 		found := false
@@ -116,6 +129,92 @@ func combineWorks(canonical, duplicate workResource) workResource {
 	}
 
 	return canonical
+}
+
+// reconcileRefreshedWork publishes a fresh provider snapshot while retaining
+// only stale editions whose IDs the caller has independently validated as
+// current members of the same work. Provider membership and metadata,
+// including explicitly cleared defaults, are otherwise authoritative. This
+// prevents removed or reassigned editions from becoming immortal cache data.
+func reconcileRefreshedWork(fresh, stale workResource, validatedStaleBookIDs map[int64]struct{}) workResource {
+	if fresh.ForeignID == 0 || stale.ForeignID == 0 || fresh.ForeignID != stale.ForeignID {
+		stabilizeLegacyBestBookID(&fresh)
+		return fresh
+	}
+
+	books := make(map[int64]bookResource, len(stale.Books)+len(fresh.Books))
+	for _, book := range stale.Books {
+		if _, validated := validatedStaleBookIDs[book.ForeignID]; validated && book.ForeignID != 0 {
+			books[book.ForeignID] = book
+		}
+	}
+	for _, book := range fresh.Books {
+		if book.ForeignID != 0 {
+			books[book.ForeignID] = book
+		}
+	}
+	fresh.Books = slices.Collect(maps.Values(books))
+	slices.SortFunc(fresh.Books, func(a, b bookResource) int {
+		return cmp.Compare(a.ForeignID, b.ForeignID)
+	})
+
+	// Do not restore the stale legacy selection. If the provider removed all
+	// defaults, stabilizeLegacyBestBookID deterministically chooses from the
+	// reconciled edition set instead of pinning an obsolete cached preference.
+	stabilizeLegacyBestBookID(&fresh)
+	return fresh
+}
+
+func mergeProviderDefaultEditions(target *workResource, source workResource) {
+	if target.DefaultCoverEditionID == 0 {
+		target.DefaultCoverEditionID = source.DefaultCoverEditionID
+	}
+	if target.DefaultEbookEditionID == 0 {
+		target.DefaultEbookEditionID = source.DefaultEbookEditionID
+	}
+	if target.DefaultAudioEditionID == 0 {
+		target.DefaultAudioEditionID = source.DefaultAudioEditionID
+	}
+	if target.DefaultPhysicalEditionID == 0 {
+		target.DefaultPhysicalEditionID = source.DefaultPhysicalEditionID
+	}
+}
+
+func providerLegacyBestBookID(work workResource) int64 {
+	for _, id := range []int64{
+		work.DefaultCoverEditionID,
+		work.DefaultEbookEditionID,
+		work.DefaultAudioEditionID,
+		work.DefaultPhysicalEditionID,
+	} {
+		if id != 0 {
+			return id
+		}
+	}
+	return 0
+}
+
+// stabilizeLegacyBestBookID keeps BestBookId as a compatibility projection of
+// Hardcover's provider defaults. Edition enrichment must not change that
+// projection. Providers without explicit defaults retain an existing valid
+// choice and only use local display ranking as a final fallback.
+func stabilizeLegacyBestBookID(work *workResource) {
+	if providerBest := providerLegacyBestBookID(*work); providerBest != 0 {
+		work.BestBookID = providerBest
+		return
+	}
+
+	if work.BestBookID != 0 {
+		for _, book := range work.Books {
+			if book.ForeignID == work.BestBookID {
+				return
+			}
+		}
+	}
+
+	if preferred := preferredDisplayEdition(work.Books); preferred != nil {
+		work.BestBookID = preferred.ForeignID
+	}
 }
 
 func preferredDisplayEdition(books []bookResource) *bookResource {
@@ -208,11 +307,45 @@ func nonAudioOnly(work workResource) bool {
 }
 
 func isAudioEdition(book bookResource) bool {
-	format := strings.ToLower(book.Format)
-	return strings.Contains(format, "audio") ||
-		strings.Contains(format, "audible") ||
-		strings.Contains(format, "cassette") ||
-		strings.Contains(format, "mp3 cd")
+	return book.MediaType == mediaTypeAudiobook || classifyMediaType(book.Format) == mediaTypeAudiobook
+}
+
+const (
+	mediaTypeUnknown   = 0
+	mediaTypeEbook     = 1
+	mediaTypeAudiobook = 2
+)
+
+// classifyMediaType is the single compatibility classifier for provider
+// format strings. Cached legacy resources without MediaType continue to work,
+// while new resources emit the explicit numeric contract Bookshelf consumes.
+func classifyMediaType(format string) int {
+	format = strings.ToLower(strings.TrimSpace(format))
+	for _, marker := range []string{
+		"audio",
+		"audible",
+		"cassette",
+		"mp3 cd",
+		"playaway",
+	} {
+		if strings.Contains(format, marker) {
+			return mediaTypeAudiobook
+		}
+	}
+	for _, marker := range []string{
+		"ebook",
+		"e-book",
+		"kindle",
+		"digital",
+		"epub",
+		"mobi",
+		"pdf",
+	} {
+		if strings.Contains(format, marker) {
+			return mediaTypeEbook
+		}
+	}
+	return mediaTypeUnknown
 }
 
 func isSpecialEdition(book bookResource) bool {
@@ -224,12 +357,17 @@ func isSpecialEdition(book bookResource) bool {
 	}, " "))
 
 	for _, term := range []string{
+		"anniversary edition",
 		"box set",
 		"boxed set",
+		"collector's edition",
 		"collection",
+		"deluxe edition",
+		"illustrated edition",
 		"large print",
 		"library binding",
 		"omnibus",
+		"revised edition",
 		"school & library",
 		"turtleback",
 	} {

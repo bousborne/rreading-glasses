@@ -39,31 +39,46 @@ fragment DefaultEditions on books {
 
   default_audio_edition {
     id
+    book_id
     contributions {
       ...Contributions
     }
   }
   default_physical_edition {
     id
+    book_id
     contributions {
       ...Contributions
     }
   }
   default_cover_edition {
     id
+    book_id
     contributions {
       ...Contributions
     }
   }
   default_ebook_edition {
     id
+    book_id
     contributions {
       ...Contributions
     }
   }
 
-  fallback: editions(order_by: { id: desc }, limit: 1) {
+  fallback: editions(
+    order_by: [
+      { score: desc_nulls_last }
+      { users_read_count: desc }
+      { id: asc }
+    ]
+    limit: 1
+  ) {
     id
+    book_id
+    contributions {
+      ...Contributions
+    }
   }
 }
 

@@ -1,5 +1,23 @@
 package internal
 
+import "encoding/json"
+
+// workCacheSchemaVersion is embedded in serialized work resources. It lets a
+// deployment distinguish pre-upgrade WorkKey/BookKey rows from payloads which
+// carry the media/default/membership semantics expected by this build.
+const workCacheSchemaVersion = 1
+
+func hasCurrentWorkCacheSchema(payload []byte, expected int) bool {
+	// Preserve the existing negative-cache sentinel.
+	if len(payload) == 1 && payload[0] == 0 {
+		return true
+	}
+	var marker struct {
+		CacheSchemaVersion int `json:"CacheSchemaVersion"`
+	}
+	return json.Unmarshal(payload, &marker) == nil && marker.CacheSchemaVersion == expected
+}
+
 // TODO: These could be generated from the OpenAPI spec.
 // https://github.com/Readarr/Readarr/blob/develop/src/Readarr.Api.V1/openapi.json
 
@@ -10,6 +28,8 @@ type bulkBookResource struct {
 }
 
 type workResource struct {
+	CacheSchemaVersion int `json:"CacheSchemaVersion,omitempty"`
+
 	ForeignID      int64    `json:"ForeignId"`
 	Title          string   `json:"Title"`      // This is what's ultimately displayed in the app.
 	FullTitle      string   `json:"FullTitle"`  // The title + subtitle.
@@ -23,10 +43,18 @@ type workResource struct {
 	Books   []bookResource   `json:"Books"`
 	Series  []SeriesResource `json:"Series"`
 	Authors []AuthorResource `json:"Authors"`
+	// ProviderEditionIDs is the authoritative current edition membership from
+	// providers which can return a complete work-edition relationship. Older
+	// clients safely ignore this additive field.
+	ProviderEditionIDs []int64 `json:"ProviderEditionIds,omitempty"`
 
 	// New fields
-	KCA        string `json:"KCA"`
-	BestBookID int64  `json:"BestBookId"`
+	KCA                      string `json:"KCA"`
+	BestBookID               int64  `json:"BestBookId"`
+	DefaultCoverEditionID    int64  `json:"DefaultCoverEditionId,omitempty"`
+	DefaultEbookEditionID    int64  `json:"DefaultEbookEditionId,omitempty"`
+	DefaultAudioEditionID    int64  `json:"DefaultAudioEditionId,omitempty"`
+	DefaultPhysicalEditionID int64  `json:"DefaultPhysicalEditionId,omitempty"`
 
 	RatingCount   int64   `json:"RatingCount"`
 	AverageRating float64 `json:"AverageRating"`
@@ -35,6 +63,8 @@ type workResource struct {
 
 // AuthorResource collects every edition of every work by an author.
 type AuthorResource struct {
+	CacheSchemaVersion int `json:"CacheSchemaVersion,omitempty"`
+
 	ForeignID     int64   `json:"ForeignId"`
 	Name          string  `json:"Name"`
 	Description   string  `json:"Description"`
@@ -65,6 +95,7 @@ type bookResource struct {
 	Publisher          string  `json:"Publisher"`
 	ImageURL           string  `json:"ImageUrl"`
 	IsEbook            bool    `json:"IsEbook"`
+	MediaType          int     `json:"MediaType"` // 0 unknown/physical, 1 ebook, 2 audiobook.
 	NumPages           int64   `json:"NumPages"`
 	RatingCount        int64   `json:"RatingCount"`
 	AverageRating      float64 `json:"AverageRating"`

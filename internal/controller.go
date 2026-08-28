@@ -40,6 +40,12 @@ var (
 
 	_seriesTTL = 14 * 24 * time.Hour // 2 weeks
 
+	// Format-split work relationships are provider repair metadata rather than
+	// ordinary response cache entries. Keep them durable across many normal
+	// work-cache lifetimes so either source ID can be refreshed as one atomic
+	// canonical work after a deployment or cache expiry.
+	_formatSplitMergeTTL = 100 * 365 * 24 * time.Hour
+
 	// _missing is a sentinel value we cache for 404 responses.
 	_missing = []byte{0}
 
@@ -174,6 +180,27 @@ type getter interface {
 	// Eventually we may consider implementing OAuth in order to return
 	// custom-tailored recommendations.
 	Recommendations(ctx context.Context, page int64) (RecommentationsResource, error)
+}
+
+// workCacheSchemaGetter identifies providers which emit the current serialized
+// work schema. Test/third-party getters without this optional interface retain
+// legacy cache behavior; the built-in GR and Hardcover getters both implement
+// it and therefore invalidate pre-upgrade WorkKey and BookKey rows.
+type workCacheSchemaGetter interface {
+	workCacheSchemaVersion() int
+}
+
+func currentWorkCachePayload(g getter, payload []byte) bool {
+	versioned, ok := g.(workCacheSchemaGetter)
+	if !ok {
+		return true
+	}
+	return hasCurrentWorkCacheSchema(payload, versioned.workCacheSchemaVersion())
+}
+
+func currentAuthorCachePayload(g getter, payload []byte) bool {
+	// Authors and their nested works advance under the same resource schema.
+	return currentWorkCachePayload(g, payload)
 }
 
 // NewUpstream creates a new http.Client with middleware appropriate for use
@@ -407,7 +434,11 @@ func (c *Controller) searchISBN(ctx context.Context, isbn isbn.ISBN) []SearchRes
 
 // GetWork loads a work or returns a cached value if one exists.
 func (c *Controller) GetWork(ctx context.Context, workID int64) ([]byte, time.Duration, error) {
-	p, err, _ := c.group.Do(WorkKey(workID), func() (any, error) {
+	flightKey := WorkKey(workID)
+	if merge, ok := c.loadFormatSplitMerge(ctx, workID); ok {
+		flightKey = formatSplitMergeKey(merge.CanonicalWorkID)
+	}
+	p, err, _ := c.group.Do(flightKey, func() (any, error) {
 		return c.getWork(ctx, workID)
 	})
 	pair := p.(ttlpair)
@@ -524,6 +555,13 @@ func (c *Controller) setISBN(ctx context.Context, isbn isbn.ISBN, editionID int6
 
 func (c *Controller) getBook(ctx context.Context, bookID int64) (ttlpair, error) {
 	workBytes, ttl, ok := c.cache.GetWithTTL(ctx, BookKey(bookID))
+	if ok && !slices.Equal(workBytes, _missing) && !currentWorkCachePayload(c.getter, workBytes) {
+		Log(ctx).Info("refreshing legacy cached edition payload", "bookID", bookID)
+		if err := c.cache.Expire(ctx, BookKey(bookID)); err != nil {
+			Log(ctx).Warn("unable to expire legacy cached edition payload", "bookID", bookID, "err", err)
+		}
+		workBytes, ttl, ok = nil, 0, false
+	}
 	if ok && ttl > 0 {
 		if slices.Equal(workBytes, _missing) {
 			return ttlpair{}, errNotFound
@@ -583,11 +621,26 @@ func (c *Controller) getBook(ctx context.Context, bookID int64) (ttlpair, error)
 
 func (c *Controller) getWork(ctx context.Context, workID int64) (ttlpair, error) {
 	cachedBytes, ttl, ok := c.cache.GetWithTTL(ctx, WorkKey(workID))
+	var legacyReconcileBytes []byte
+	if ok && !slices.Equal(cachedBytes, _missing) && !currentWorkCachePayload(c.getter, cachedBytes) {
+		Log(ctx).Info("refreshing legacy cached work payload", "workID", workID)
+		// This payload is not safe to return or use as an upstream identity
+		// shortcut, but its enriched edition metadata can still be retained after
+		// the fresh provider membership independently validates each edition ID.
+		legacyReconcileBytes = bytes.Clone(cachedBytes)
+		if err := c.cache.Expire(ctx, WorkKey(workID)); err != nil {
+			Log(ctx).Warn("unable to expire legacy cached work payload", "workID", workID, "err", err)
+		}
+		cachedBytes, ttl, ok = nil, 0, false
+	}
 	if ok && ttl > 0 {
 		if slices.Equal(cachedBytes, _missing) {
 			return ttlpair{}, errNotFound
 		}
 		return ttlpair{bytes: cachedBytes, ttl: ttl}, nil
+	}
+	if merge, merged := c.loadFormatSplitMerge(ctx, workID); merged {
+		return c.refreshFormatSplitMerge(ctx, workID, merge, cachedBytes)
 	}
 
 	// Cache miss.
@@ -599,6 +652,25 @@ func (c *Controller) getWork(ctx context.Context, workID int64) (ttlpair, error)
 	if err != nil {
 		Log(ctx).Warn("problem getting work", "err", err, "workID", workID)
 		return ttlpair{}, err
+	}
+
+	var fresh workResource
+	if unmarshalErr := json.Unmarshal(workBytes, &fresh); unmarshalErr != nil {
+		return ttlpair{}, fmt.Errorf("unmarshaling refreshed work %d: %w", workID, unmarshalErr)
+	}
+	reconcileBytes := cachedBytes
+	if len(reconcileBytes) == 0 {
+		reconcileBytes = legacyReconcileBytes
+	}
+	if len(reconcileBytes) > 0 {
+		var stale workResource
+		if unmarshalErr := json.Unmarshal(reconcileBytes, &stale); unmarshalErr == nil {
+			fresh = reconcileRefreshedWork(fresh, stale, editionIDSet(fresh.ProviderEditionIDs))
+		}
+	}
+	workBytes, err = json.Marshal(fresh)
+	if err != nil {
+		return ttlpair{}, fmt.Errorf("marshaling refreshed work %d: %w", workID, err)
 	}
 
 	ttl = fuzz(_workTTL, 1.5)
@@ -641,12 +713,293 @@ func (c *Controller) getWork(ctx context.Context, workID int64) (ttlpair, error)
 		return nil
 	})
 
-	// Return the last cached value to give the refresh time to complete.
-	if len(cachedBytes) > 0 {
-		return ttlpair{bytes: cachedBytes, ttl: ttl}, err
+	// The provider refresh and stale-edition reconciliation above are complete
+	// and have already been published atomically. Returning the expired payload
+	// here would let the first caller persist provider defaults which are older
+	// than the value we just wrote to the cache.
+	return ttlpair{bytes: workBytes, ttl: ttl}, err
+}
+
+type formatSplitMerge struct {
+	CanonicalWorkID int64   `json:"canonicalWorkId"`
+	SourceWorkIDs   []int64 `json:"sourceWorkIds"`
+}
+
+func formatSplitMergeKey(workID int64) string {
+	return fmt.Sprintf("fm%d", workID)
+}
+
+func formatSplitSourceKey(workID int64) string {
+	return fmt.Sprintf("fs%d", workID)
+}
+
+func normalizeFormatSplitMerge(merge formatSplitMerge) (formatSplitMerge, bool) {
+	if merge.CanonicalWorkID == 0 {
+		return formatSplitMerge{}, false
 	}
 
-	return ttlpair{bytes: workBytes, ttl: ttl}, err
+	seen := make(map[int64]struct{}, len(merge.SourceWorkIDs)+1)
+	sources := make([]int64, 0, len(merge.SourceWorkIDs)+1)
+	add := func(id int64) {
+		if id == 0 {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		seen[id] = struct{}{}
+		sources = append(sources, id)
+	}
+	add(merge.CanonicalWorkID)
+	for _, id := range merge.SourceWorkIDs {
+		add(id)
+	}
+	if len(sources) < 2 {
+		return formatSplitMerge{}, false
+	}
+	aliases := sources[1:]
+	slices.Sort(aliases)
+	merge.SourceWorkIDs = sources
+	return merge, true
+}
+
+func (c *Controller) loadFormatSplitMerge(ctx context.Context, workID int64) (formatSplitMerge, bool) {
+	data, _, ok := c.cache.GetWithTTL(ctx, formatSplitMergeKey(workID))
+	if !ok || len(data) == 0 {
+		return formatSplitMerge{}, false
+	}
+	var merge formatSplitMerge
+	if err := json.Unmarshal(data, &merge); err != nil {
+		Log(ctx).Warn("discarding malformed format-split merge record", "workID", workID, "err", err)
+		return formatSplitMerge{}, false
+	}
+	merge, valid := normalizeFormatSplitMerge(merge)
+	if !valid || !slices.Contains(merge.SourceWorkIDs, workID) {
+		Log(ctx).Warn("discarding invalid format-split merge record", "workID", workID)
+		return formatSplitMerge{}, false
+	}
+	return merge, true
+}
+
+func (c *Controller) persistFormatSplitMerge(ctx context.Context, merge formatSplitMerge, sources map[int64]workResource) {
+	merge, ok := normalizeFormatSplitMerge(merge)
+	if !ok {
+		return
+	}
+	data, err := json.Marshal(merge)
+	if err != nil {
+		Log(ctx).Warn("unable to marshal format-split merge record", "err", err)
+		return
+	}
+	for _, sourceID := range merge.SourceWorkIDs {
+		source, exists := sources[sourceID]
+		if !exists || source.ForeignID != sourceID {
+			Log(ctx).Warn("refusing incomplete format-split merge record", "sourceWorkID", sourceID)
+			return
+		}
+	}
+
+	// Write source snapshots first and publish the relationship last. A reader
+	// can therefore never observe a new merge descriptor without every source
+	// required to rebuild it.
+	for _, sourceID := range merge.SourceWorkIDs {
+		sourceBytes, marshalErr := json.Marshal(sources[sourceID])
+		if marshalErr != nil {
+			Log(ctx).Warn("unable to marshal format-split source", "sourceWorkID", sourceID, "err", marshalErr)
+			return
+		}
+		c.cache.Set(ctx, formatSplitSourceKey(sourceID), sourceBytes, _formatSplitMergeTTL)
+	}
+	for _, sourceID := range merge.SourceWorkIDs {
+		c.cache.Set(ctx, formatSplitMergeKey(sourceID), data, _formatSplitMergeTTL)
+	}
+}
+
+func (c *Controller) refreshFormatSplitMerge(ctx context.Context, requestedWorkID int64, merge formatSplitMerge, expiredBytes []byte) (ttlpair, error) {
+	merge, ok := normalizeFormatSplitMerge(merge)
+	if !ok {
+		return ttlpair{}, errors.Join(errNotFound, errors.New("invalid format-split merge"))
+	}
+
+	// HCGetter shares this cache. Expire every published merged WorkKey before
+	// fetching so a still-live sibling key cannot masquerade as a raw provider
+	// source and silently preserve stale defaults.
+	for _, sourceID := range merge.SourceWorkIDs {
+		if err := c.cache.Expire(ctx, WorkKey(sourceID)); err != nil {
+			return ttlpair{}, fmt.Errorf("expiring merged source work %d: %w", sourceID, err)
+		}
+	}
+
+	sources := make(map[int64]workResource, len(merge.SourceWorkIDs))
+	authorID := int64(0)
+	for _, sourceID := range merge.SourceWorkIDs {
+		freshBytes, freshAuthorID, err := c.getter.GetWork(ctx, sourceID, c.saveEditions)
+		if err != nil {
+			return ttlpair{}, fmt.Errorf("refreshing format-split source work %d: %w", sourceID, err)
+		}
+		var fresh workResource
+		if err := json.Unmarshal(freshBytes, &fresh); err != nil {
+			return ttlpair{}, fmt.Errorf("unmarshaling format-split source work %d: %w", sourceID, err)
+		}
+		if fresh.ForeignID != sourceID {
+			if fresh.ForeignID == 0 {
+				return ttlpair{}, fmt.Errorf("format-split source identity missing: requested=%d", sourceID)
+			}
+			// Hardcover has canonicalized one of the formerly split works. The
+			// returned provider canonical is now authoritative; retaining the old
+			// relationship would make every future expiry retry an impossible raw
+			// source ID forever.
+			return c.resolveFormatSplitRedirect(ctx, merge, fresh, freshAuthorID, expiredBytes)
+		}
+		if authorID == 0 {
+			authorID = freshAuthorID
+		} else if freshAuthorID != 0 && freshAuthorID != authorID {
+			return ttlpair{}, fmt.Errorf("format-split sources have different authors: expected=%d got=%d", authorID, freshAuthorID)
+		}
+
+		if staleBytes, _, found := c.cache.GetWithTTL(ctx, formatSplitSourceKey(sourceID)); found {
+			var stale workResource
+			if err := json.Unmarshal(staleBytes, &stale); err == nil {
+				fresh = reconcileRefreshedWork(fresh, stale, editionIDSet(fresh.ProviderEditionIDs))
+			}
+		}
+		sources[sourceID] = fresh
+	}
+	if !formatSplitSourcesStillMerge(merge, sources) {
+		return c.resolveFormatSplitDivergence(ctx, requestedWorkID, merge, sources, authorID)
+	}
+
+	merged := sources[merge.CanonicalWorkID]
+	for _, sourceID := range merge.SourceWorkIDs[1:] {
+		merged = combineWorks(merged, sources[sourceID])
+	}
+	if merged.ForeignID != merge.CanonicalWorkID {
+		return ttlpair{}, fmt.Errorf("format-split canonical identity mismatch: expected=%d got=%d", merge.CanonicalWorkID, merged.ForeignID)
+	}
+	if len(expiredBytes) > 0 {
+		var staleMerged workResource
+		if err := json.Unmarshal(expiredBytes, &staleMerged); err == nil {
+			merged = reconcileRefreshedWork(merged, staleMerged, editionIDSet(merged.ProviderEditionIDs))
+		}
+	}
+
+	mergedBytes, err := json.Marshal(merged)
+	if err != nil {
+		return ttlpair{}, fmt.Errorf("marshaling format-split work %d: %w", merge.CanonicalWorkID, err)
+	}
+	ttl := fuzz(_workTTL, 1.5)
+	// Publish only after every source refreshed and the canonical payload was
+	// fully rebuilt. Both source IDs receive the exact same canonical bytes.
+	for _, sourceID := range merge.SourceWorkIDs {
+		c.cache.Set(ctx, WorkKey(sourceID), mergedBytes, ttl)
+	}
+	c.persistFormatSplitMerge(ctx, merge, sources)
+
+	c.scheduleFormatSplitAuthor(authorID, merge.CanonicalWorkID)
+	return ttlpair{bytes: mergedBytes, ttl: ttl}, nil
+}
+
+func formatSplitSourcesStillMerge(merge formatSplitMerge, sources map[int64]workResource) bool {
+	works := make([]workResource, 0, len(merge.SourceWorkIDs))
+	for _, sourceID := range merge.SourceWorkIDs {
+		source, ok := sources[sourceID]
+		if !ok {
+			return false
+		}
+		works = append(works, source)
+	}
+	merged, aliases := mergeDuplicateFormatWorks(works)
+	if len(merged) != 1 || merged[0].ForeignID != merge.CanonicalWorkID || len(aliases) != len(merge.SourceWorkIDs)-1 {
+		return false
+	}
+	for _, sourceID := range merge.SourceWorkIDs {
+		if sourceID == merge.CanonicalWorkID {
+			continue
+		}
+		if aliases[sourceID] != merge.CanonicalWorkID {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Controller) retireFormatSplitMerge(ctx context.Context, merge formatSplitMerge) error {
+	var retireErr error
+	for _, sourceID := range merge.SourceWorkIDs {
+		retireErr = errors.Join(retireErr, c.cache.Delete(ctx, formatSplitMergeKey(sourceID)))
+		retireErr = errors.Join(retireErr, c.cache.Delete(ctx, formatSplitSourceKey(sourceID)))
+	}
+	return retireErr
+}
+
+func (c *Controller) resolveFormatSplitDivergence(ctx context.Context, requestedWorkID int64, merge formatSplitMerge, sources map[int64]workResource, authorID int64) (ttlpair, error) {
+	serialized := make(map[int64][]byte, len(sources))
+	for sourceID, source := range sources {
+		data, err := json.Marshal(source)
+		if err != nil {
+			return ttlpair{}, fmt.Errorf("marshaling corrected format-split source %d: %w", sourceID, err)
+		}
+		serialized[sourceID] = data
+	}
+	if err := c.retireFormatSplitMerge(ctx, merge); err != nil {
+		return ttlpair{}, fmt.Errorf("retiring diverged format-split relationship: %w", err)
+	}
+
+	ttl := fuzz(_workTTL, 1.5)
+	for sourceID, data := range serialized {
+		c.cache.Set(ctx, WorkKey(sourceID), data, ttl)
+	}
+	requested, ok := serialized[requestedWorkID]
+	if !ok {
+		return ttlpair{}, fmt.Errorf("corrected format-split relationship omitted requested work %d", requestedWorkID)
+	}
+	if authorID > 0 {
+		// The author's cached work list may still contain the old combined
+		// record. Mark it for a complete explicit refresh rather than trying to
+		// repair a topology change with a single incremental edge.
+		c.cache.Set(ctx, authorRefreshNeededKey(authorID), []byte{1}, 365*24*time.Hour)
+	}
+	return ttlpair{bytes: requested, ttl: ttl}, nil
+}
+
+func (c *Controller) resolveFormatSplitRedirect(ctx context.Context, merge formatSplitMerge, canonical workResource, authorID int64, expiredBytes []byte) (ttlpair, error) {
+	if len(expiredBytes) > 0 {
+		var staleMerged workResource
+		if err := json.Unmarshal(expiredBytes, &staleMerged); err == nil && staleMerged.ForeignID == canonical.ForeignID {
+			canonical = reconcileRefreshedWork(canonical, staleMerged, editionIDSet(canonical.ProviderEditionIDs))
+		}
+	}
+	canonicalBytes, err := json.Marshal(canonical)
+	if err != nil {
+		return ttlpair{}, fmt.Errorf("marshaling redirected format-split work %d: %w", canonical.ForeignID, err)
+	}
+
+	// Delete the relationship before publishing the redirect. If durable state
+	// cannot be retired, fail closed so a later request can retry the cleanup
+	// instead of leaving a permanent descriptor/identity mismatch loop.
+	if err := c.retireFormatSplitMerge(ctx, merge); err != nil {
+		return ttlpair{}, fmt.Errorf("retiring canonicalized format-split relationship: %w", err)
+	}
+
+	ttl := fuzz(_workTTL, 1.5)
+	for _, sourceID := range merge.SourceWorkIDs {
+		c.cache.Set(ctx, WorkKey(sourceID), canonicalBytes, ttl)
+	}
+	c.cache.Set(ctx, WorkKey(canonical.ForeignID), canonicalBytes, ttl)
+	c.scheduleFormatSplitAuthor(authorID, canonical.ForeignID)
+	return ttlpair{bytes: canonicalBytes, ttl: ttl}, nil
+}
+
+func (c *Controller) scheduleFormatSplitAuthor(authorID, workID int64) {
+	if authorID == 0 {
+		return
+	}
+	c.workG.Go(func() error {
+		background := context.WithValue(context.Background(), middleware.RequestIDKey, fmt.Sprintf("refresh-format-split-%d", workID))
+		_, _, _ = c.getAuthorForDenormalization(background, authorID)
+		_ = c.enqueueDenorm(background, edge{kind: authorEdge, parentID: authorID, childIDs: newSet(workID)})
+		return nil
+	})
 }
 
 func (c *Controller) getSeries(ctx context.Context, seriesID int64) ([]byte, error) {
@@ -756,12 +1109,25 @@ func (c *Controller) getAuthor(ctx context.Context, authorID int64) (ttlpair, er
 		if slices.Equal(preRefreshBytes, _missing) {
 			return ttlpair{}, errNotFound
 		}
-		return ttlpair{bytes: preRefreshBytes, ttl: time.Hour}, nil
+		if currentAuthorCachePayload(c.getter, preRefreshBytes) {
+			return ttlpair{bytes: preRefreshBytes, ttl: time.Hour}, nil
+		}
+		Log(ctx).Info("discarding legacy pre-refresh author payload", "authorID", authorID)
+		if err := c.cache.Delete(ctx, refreshAuthorKey(authorID)); err != nil {
+			Log(ctx).Warn("unable to delete legacy pre-refresh author payload", "authorID", authorID, "err", err)
+		}
 	}
 
 	// If we're not refreshing then return the cached value as long as it's
 	// still valid.
 	cachedBytes, ttl, ok := c.cache.GetWithTTL(ctx, AuthorKey(authorID))
+	if ok && !slices.Equal(cachedBytes, _missing) && !currentAuthorCachePayload(c.getter, cachedBytes) {
+		Log(ctx).Info("refreshing legacy cached author payload", "authorID", authorID)
+		if err := c.cache.Expire(ctx, AuthorKey(authorID)); err != nil {
+			Log(ctx).Warn("unable to expire legacy cached author payload", "authorID", authorID, "err", err)
+		}
+		cachedBytes, ttl, ok = nil, 0, false
+	}
 	if ok && ttl > 0 {
 		if slices.Equal(cachedBytes, _missing) {
 			return ttlpair{}, errNotFound
@@ -778,6 +1144,9 @@ func (c *Controller) getAuthor(ctx context.Context, authorID int64) (ttlpair, er
 	if err != nil {
 		Log(ctx).Warn("problem getting author", "err", err, "authorID", authorID)
 		return ttlpair{}, err
+	}
+	if !currentAuthorCachePayload(c.getter, authorBytes) {
+		return ttlpair{}, fmt.Errorf("provider returned author %d with stale cache schema", authorID)
 	}
 
 	ttl = fuzz(_authorTTL, 1.5)
@@ -1357,6 +1726,9 @@ func (c *Controller) denormalizeEditions(ctx context.Context, workID int64, book
 	if len(bookIDs) == 0 {
 		return nil
 	}
+	if merge, merged := c.loadFormatSplitMerge(ctx, workID); merged {
+		return c.denormalizeFormatSplitEditions(ctx, merge, bookIDs...)
+	}
 
 	workBytes, _, err := c.getter.GetWork(ctx, workID, nil)
 	if err != nil {
@@ -1364,20 +1736,39 @@ func (c *Controller) denormalizeEditions(ctx context.Context, workID int64, book
 		return err
 	}
 
-	old := newETagWriter()
-	r := io.TeeReader(bytes.NewReader(workBytes), old)
-
 	var work workResource
-	err = sonic.ConfigStd.NewDecoder(r).Decode(&work)
+	err = sonic.ConfigStd.Unmarshal(workBytes, &work)
 	if err != nil {
 		Log(ctx).Debug("problem unmarshaling work", "err", err, "workID", workID)
 		_ = c.cache.Expire(ctx, WorkKey(workID))
 		return err
 	}
+	baseline := work
+	if cachedBytes, _, ok := c.cache.GetWithTTL(ctx, WorkKey(work.ForeignID)); ok && !slices.Equal(cachedBytes, _missing) {
+		var cached workResource
+		if err := sonic.ConfigStd.Unmarshal(cachedBytes, &cached); err == nil {
+			baseline = cached
+			work = reconcileRefreshedWork(work, cached, editionIDSet(work.ProviderEditionIDs))
+		}
+	}
+
+	old := newETagWriter()
+	if err := sonic.ConfigStd.NewEncoder(old).Encode(baseline); err != nil {
+		return fmt.Errorf("hashing cached work %d: %w", workID, err)
+	}
 
 	Log(ctx).Debug("ensuring work-edition edges", "workID", workID, "bookIDs", bookIDs)
+	providerMembership := editionIDSet(work.ProviderEditionIDs)
 
 	for _, bookID := range bookIDs {
+		if len(providerMembership) != 0 {
+			if _, current := providerMembership[bookID]; !current {
+				Log(ctx).Warn("refusing edition omitted from authoritative provider membership",
+					"workID", workID,
+					"bookID", bookID)
+				continue
+			}
+		}
 		workBytes, _, _, err = c.getter.GetBook(ctx, bookID, nil)
 		if err != nil {
 			// Maybe the cache wasn't able to refresh because it was deleted? Move on.
@@ -1393,6 +1784,14 @@ func (c *Controller) denormalizeEditions(ctx context.Context, workID int64, book
 		}
 		if len(w.Books) != 1 {
 			Log(ctx).Warn("unexpected number of books", "bookID", bookID, "count", len(w.Books))
+			continue
+		}
+		if w.ForeignID != work.ForeignID {
+			Log(ctx).Warn("refusing cross-work edition denormalization",
+				"requestedWorkID", workID,
+				"targetWorkID", work.ForeignID,
+				"editionWorkID", w.ForeignID,
+				"bookID", bookID)
 			continue
 		}
 
@@ -1411,9 +1810,7 @@ func (c *Controller) denormalizeEditions(ctx context.Context, workID int64, book
 		}
 	}
 
-	if preferred := preferredDisplayEdition(work.Books); preferred != nil {
-		work.BestBookID = preferred.ForeignID
-	}
+	stabilizeLegacyBestBookID(&work)
 
 	buf := _buffers.Get()
 	defer buf.Free()
@@ -1444,6 +1841,142 @@ func (c *Controller) denormalizeEditions(ctx context.Context, workID int64, book
 		}
 	}
 
+	return nil
+}
+
+// denormalizeFormatSplitEditions updates the raw provider source identified by
+// each edition before rebuilding the canonical format-split work. WorkKey for
+// an alias deliberately contains the canonical payload, so the ordinary
+// denormalization identity check cannot distinguish a legitimate alias
+// edition from an unrelated cross-work edition.
+func (c *Controller) denormalizeFormatSplitEditions(ctx context.Context, merge formatSplitMerge, bookIDs ...int64) error {
+	merge, ok := normalizeFormatSplitMerge(merge)
+	if !ok {
+		return errors.Join(errNotFound, errors.New("invalid format-split merge"))
+	}
+
+	sources := make(map[int64]workResource, len(merge.SourceWorkIDs))
+	for _, sourceID := range merge.SourceWorkIDs {
+		sourceBytes, _, found := c.cache.GetWithTTL(ctx, formatSplitSourceKey(sourceID))
+		if !found || len(sourceBytes) == 0 {
+			return fmt.Errorf("format-split source snapshot %d is missing", sourceID)
+		}
+		var source workResource
+		if err := sonic.ConfigStd.Unmarshal(sourceBytes, &source); err != nil {
+			return fmt.Errorf("unmarshaling format-split source %d: %w", sourceID, err)
+		}
+		if source.ForeignID != sourceID {
+			return fmt.Errorf("format-split source identity mismatch: expected=%d got=%d", sourceID, source.ForeignID)
+		}
+		sources[sourceID] = source
+	}
+
+	changed := false
+	for _, requestedBookID := range bookIDs {
+		bookBytes, relatedWorkID, _, err := c.getter.GetBook(ctx, requestedBookID, nil)
+		if err != nil {
+			Log(ctx).Warn("unable to denormalize format-split edition",
+				"err", err,
+				"canonicalWorkID", merge.CanonicalWorkID,
+				"bookID", requestedBookID)
+			continue
+		}
+		var editionWork workResource
+		if err := sonic.ConfigStd.Unmarshal(bookBytes, &editionWork); err != nil {
+			Log(ctx).Warn("problem unmarshaling format-split edition", "err", err, "bookID", requestedBookID)
+			_ = c.cache.Expire(ctx, BookKey(requestedBookID))
+			continue
+		}
+		if len(editionWork.Books) != 1 {
+			Log(ctx).Warn("unexpected number of books in format-split edition",
+				"bookID", requestedBookID,
+				"count", len(editionWork.Books))
+			continue
+		}
+		if relatedWorkID != 0 && relatedWorkID != editionWork.ForeignID {
+			Log(ctx).Warn("refusing format-split edition with inconsistent provider relationship",
+				"bookID", requestedBookID,
+				"relationshipWorkID", relatedWorkID,
+				"payloadWorkID", editionWork.ForeignID)
+			continue
+		}
+
+		source, belongsToSource := sources[editionWork.ForeignID]
+		if !belongsToSource {
+			Log(ctx).Warn("refusing edition outside format-split source relationship",
+				"canonicalWorkID", merge.CanonicalWorkID,
+				"editionWorkID", editionWork.ForeignID,
+				"bookID", requestedBookID)
+			continue
+		}
+
+		book := editionWork.Books[0]
+		if book.ForeignID == 0 {
+			Log(ctx).Warn("refusing format-split edition without provider identity", "bookID", requestedBookID)
+			continue
+		}
+		providerMembership := editionIDSet(source.ProviderEditionIDs)
+		if len(providerMembership) != 0 {
+			if _, current := providerMembership[requestedBookID]; !current {
+				Log(ctx).Warn("refusing format-split edition omitted from authoritative source membership",
+					"sourceWorkID", source.ForeignID,
+					"bookID", requestedBookID)
+				continue
+			}
+			if _, current := providerMembership[book.ForeignID]; !current {
+				Log(ctx).Warn("refusing resolved format-split edition omitted from authoritative source membership",
+					"sourceWorkID", source.ForeignID,
+					"requestedBookID", requestedBookID,
+					"resolvedBookID", book.ForeignID)
+				continue
+			}
+		}
+		idx, found := slices.BinarySearchFunc(source.Books, book.ForeignID, func(candidate bookResource, id int64) int {
+			return cmp.Compare(candidate.ForeignID, id)
+		})
+		if found {
+			source.Books[idx] = book
+		} else {
+			source.Books = slices.Insert(source.Books, idx, book)
+		}
+
+		stabilizeLegacyBestBookID(&source)
+		sources[source.ForeignID] = source
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	if !formatSplitSourcesStillMerge(merge, sources) {
+		return errors.New("format-split source topology changed while denormalizing edition")
+	}
+
+	merged := sources[merge.CanonicalWorkID]
+	for _, sourceID := range merge.SourceWorkIDs[1:] {
+		merged = combineWorks(merged, sources[sourceID])
+	}
+	if merged.ForeignID != merge.CanonicalWorkID {
+		return fmt.Errorf("format-split canonical identity mismatch: expected=%d got=%d", merge.CanonicalWorkID, merged.ForeignID)
+	}
+	mergedBytes, err := sonic.ConfigStd.Marshal(merged)
+	if err != nil {
+		return fmt.Errorf("marshaling denormalized format-split work %d: %w", merge.CanonicalWorkID, err)
+	}
+
+	// Persist source provenance first, then publish the same complete canonical
+	// value under every public source key. A later expiry can therefore rebuild
+	// the merge without losing an edition discovered through an alias.
+	c.persistFormatSplitMerge(ctx, merge, sources)
+	ttl := fuzz(_workTTL, 1.5)
+	for _, sourceID := range merge.SourceWorkIDs {
+		c.cache.Set(ctx, WorkKey(sourceID), mergedBytes, ttl)
+	}
+
+	for _, author := range merged.Authors {
+		if !c.enqueueDenorm(ctx, edge{kind: authorEdge, parentID: author.ForeignID, childIDs: newSet(merge.CanonicalWorkID)}) {
+			return ctx.Err()
+		}
+	}
 	return nil
 }
 
@@ -1506,9 +2039,18 @@ func (c *Controller) denormalizeWorks(ctx context.Context, authorID int64, workI
 		}
 	}
 
+	sourceWorks := make(map[int64]workResource, len(author.Works))
+	for _, source := range author.Works {
+		sourceWorks[source.ForeignID] = source
+	}
+
 	var aliases map[int64]int64
 	author.Works, aliases = mergeDuplicateFormatWorks(author.Works)
+	aliasesByCanonical := make(map[int64][]int64)
 	for aliasID, canonicalID := range aliases {
+		aliasesByCanonical[canonicalID] = append(aliasesByCanonical[canonicalID], aliasID)
+	}
+	for canonicalID, aliasIDs := range aliasesByCanonical {
 		idx, found := slices.BinarySearchFunc(author.Works, canonicalID, func(w workResource, id int64) int {
 			return cmp.Compare(w.ForeignID, id)
 		})
@@ -1520,9 +2062,16 @@ func (c *Controller) denormalizeWorks(ctx context.Context, authorID int64, workI
 		if marshalErr != nil {
 			continue
 		}
+		merge := formatSplitMerge{
+			CanonicalWorkID: canonicalID,
+			SourceWorkIDs:   append([]int64{canonicalID}, aliasIDs...),
+		}
+		c.persistFormatSplitMerge(ctx, merge, sourceWorks)
 		c.cache.Set(ctx, WorkKey(canonicalID), mergedBytes, fuzz(_workTTL, 1.5))
-		c.cache.Set(ctx, WorkKey(aliasID), mergedBytes, fuzz(_workTTL, 1.5))
-		Log(ctx).Info("merged high-confidence format-split works", "canonicalWorkID", canonicalID, "aliasWorkID", aliasID)
+		for _, aliasID := range aliasIDs {
+			c.cache.Set(ctx, WorkKey(aliasID), mergedBytes, fuzz(_workTTL, 1.5))
+		}
+		Log(ctx).Info("merged high-confidence format-split works", "canonicalWorkID", canonicalID, "aliasWorkIDs", aliasIDs)
 	}
 
 	author.Series = []SeriesResource{}

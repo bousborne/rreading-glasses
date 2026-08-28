@@ -315,3 +315,65 @@ func (c *MockgetterSearchCall) DoAndReturn(f func(context.Context, string) ([]Se
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }
+
+// MockworkCacheSchemaGetter is a mock of workCacheSchemaGetter interface.
+type MockworkCacheSchemaGetter struct {
+	ctrl     *gomock.Controller
+	recorder *MockworkCacheSchemaGetterMockRecorder
+	isgomock struct{}
+}
+
+// MockworkCacheSchemaGetterMockRecorder is the mock recorder for MockworkCacheSchemaGetter.
+type MockworkCacheSchemaGetterMockRecorder struct {
+	mock *MockworkCacheSchemaGetter
+}
+
+// NewMockworkCacheSchemaGetter creates a new mock instance.
+func NewMockworkCacheSchemaGetter(ctrl *gomock.Controller) *MockworkCacheSchemaGetter {
+	mock := &MockworkCacheSchemaGetter{ctrl: ctrl}
+	mock.recorder = &MockworkCacheSchemaGetterMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockworkCacheSchemaGetter) EXPECT() *MockworkCacheSchemaGetterMockRecorder {
+	return m.recorder
+}
+
+// workCacheSchemaVersion mocks base method.
+func (m *MockworkCacheSchemaGetter) workCacheSchemaVersion() int {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "workCacheSchemaVersion")
+	ret0, _ := ret[0].(int)
+	return ret0
+}
+
+// workCacheSchemaVersion indicates an expected call of workCacheSchemaVersion.
+func (mr *MockworkCacheSchemaGetterMockRecorder) workCacheSchemaVersion() *MockworkCacheSchemaGetterworkCacheSchemaVersionCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "workCacheSchemaVersion", reflect.TypeOf((*MockworkCacheSchemaGetter)(nil).workCacheSchemaVersion))
+	return &MockworkCacheSchemaGetterworkCacheSchemaVersionCall{Call: call}
+}
+
+// MockworkCacheSchemaGetterworkCacheSchemaVersionCall wrap *gomock.Call
+type MockworkCacheSchemaGetterworkCacheSchemaVersionCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockworkCacheSchemaGetterworkCacheSchemaVersionCall) Return(arg0 int) *MockworkCacheSchemaGetterworkCacheSchemaVersionCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockworkCacheSchemaGetterworkCacheSchemaVersionCall) Do(f func() int) *MockworkCacheSchemaGetterworkCacheSchemaVersionCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockworkCacheSchemaGetterworkCacheSchemaVersionCall) DoAndReturn(f func() int) *MockworkCacheSchemaGetterworkCacheSchemaVersionCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}

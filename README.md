@@ -195,6 +195,33 @@ Live Hardcover tests are excluded from routine `go test ./...` runs even when
 an API key is present. Run them deliberately with
 `RUN_HARDCOVER_INTEGRATION=1 HARDCOVER_API_KEY=... go test ./internal -run 'Test(Batching|HardcoverIntegration)'`.
 
+### Hardcover metadata compatibility contract
+
+Hardcover work responses preserve the provider's distinct edition choices in
+the additive `DefaultCoverEditionId`, `DefaultEbookEditionId`,
+`DefaultAudioEditionId`, and `DefaultPhysicalEditionId` fields. `BestBookId`
+remains the stable legacy projection of those defaults for clients which only
+understand one selected edition. Each edition also carries an additive
+`MediaType` value (`0` unknown/physical, `1` ebook, `2` audiobook), while the
+legacy `IsEbook` field remains consistent for older clients.
+
+`ProviderEditionIds` records Hardcover's authoritative current membership for
+a work. Refreshes use that set to remove editions which Hardcover deleted or
+reassigned and to prevent stale asynchronous work from adding them back.
+Format-split works are cached with durable source descriptors; every refresh
+revalidates that the sources still represent the same title before combining
+them, and retires the relationship if Hardcover corrects the topology. An
+edition discovered through a split-work alias enriches only its matching raw
+source snapshot and only when its ID remains in that source's authoritative
+provider membership; the complete canonical work is then republished under
+every source ID. All of these JSON fields are additive, so older
+Bookshelf/Readarr clients safely ignore the fields they do not understand.
+
+Serialized works and authors also carry an internal `CacheSchemaVersion`. After
+an upgrade, live legacy work, edition, and author rows without the current
+marker are refreshed on first use instead of remaining active until their
+normal multi-week TTL expires.
+
 ### Resource Requirements
 
 Resource requirements are minimal; a Raspberry Pi should suffice. Storage

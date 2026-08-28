@@ -1,9 +1,10 @@
-//go:generate go run go.uber.org/mock/mockgen -typed -source hardcover_test.go -package hardcover -destination hardcover/mock.go . gql
+//go:generate go run go.uber.org/mock/mockgen -typed -source hardcover_test.go -package hardcover -destination ../hardcover/mock.go . gql
 package internal
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -42,7 +43,8 @@ func TestBestHardcoverEditionUsesAudioDefault(t *testing.T) {
 			Contributions: hardcover.Contributions{Author: author},
 		}},
 		Default_audio_edition: hardcover.DefaultEditionsDefault_audio_editionEditions{
-			Id: audioID,
+			Id:      audioID,
+			Book_id: 789,
 			Contributions: []hardcover.DefaultEditionsDefault_audio_editionEditionsContributions{{
 				Contributions: hardcover.Contributions{Author: author},
 			}},
@@ -52,15 +54,639 @@ func TestBestHardcoverEditionUsesAudioDefault(t *testing.T) {
 	assert.Equal(t, audioID, bestHardcoverEdition(defaults, authorID))
 }
 
+func TestHardcoverDefaultsPreserveDistinctProviderChoices(t *testing.T) {
+	const (
+		workID     = int64(100)
+		authorID   = int64(200)
+		coverID    = int64(301)
+		ebookID    = int64(302)
+		audioID    = int64(303)
+		physicalID = int64(304)
+	)
+
+	defaults := testHardcoverDefaults(workID, authorID, coverID, ebookID, audioID, physicalID, 0)
+	ids := validatedHardcoverDefaults(defaults, authorID)
+	assert.Equal(t, hardcoverDefaultEditionIDs{
+		cover:    coverID,
+		ebook:    ebookID,
+		audio:    audioID,
+		physical: physicalID,
+	}, ids)
+	assert.Equal(t, coverID, ids.legacyBestID())
+
+	work, err := mapHardcoverToWorkResource(t.Context(), hardcover.EditionInfo{
+		Id:      ebookID,
+		Book_id: workID,
+		Title:   "Provider Defaults",
+		Language: hardcover.EditionInfoLanguageLanguages{
+			Code3: "eng",
+		},
+	}, testHardcoverWork(workID, authorID, defaults))
+	require.NoError(t, err)
+	assert.Equal(t, coverID, work.BestBookID)
+	assert.Equal(t, workCacheSchemaVersion, work.CacheSchemaVersion)
+	assert.Equal(t, coverID, work.DefaultCoverEditionID)
+	assert.Equal(t, ebookID, work.DefaultEbookEditionID)
+	assert.Equal(t, audioID, work.DefaultAudioEditionID)
+	assert.Empty(t, work.ProviderEditionIDs, "a one-edition lookup must not claim complete provider membership")
+	assert.Equal(t, physicalID, work.DefaultPhysicalEditionID)
+
+	payload, err := json.Marshal(work)
+	require.NoError(t, err)
+	assert.JSONEq(t, fmt.Sprintf(`{
+		"BestBookId": %d,
+		"DefaultCoverEditionId": %d,
+		"DefaultEbookEditionId": %d,
+		"DefaultAudioEditionId": %d,
+		"DefaultPhysicalEditionId": %d
+	}`, coverID, coverID, ebookID, audioID, physicalID), selectDefaultEditionJSON(t, payload))
+}
+
+func TestHardcoverDefaultsRejectWrongWorkAndAuthor(t *testing.T) {
+	const (
+		workID   = int64(100)
+		authorID = int64(200)
+	)
+
+	defaults := testHardcoverDefaults(workID, authorID, 301, 302, 303, 304, 305)
+	defaults.Default_cover_edition.Book_id = 999
+	defaults.Default_ebook_edition.Contributions[0].Author.Id = 999
+
+	ids := validatedHardcoverDefaults(defaults, authorID)
+	assert.Zero(t, ids.cover)
+	assert.Zero(t, ids.ebook)
+	assert.Equal(t, int64(303), ids.audio)
+	assert.Equal(t, int64(304), ids.physical)
+	assert.Equal(t, int64(305), ids.fallback)
+	assert.Equal(t, int64(303), ids.legacyBestID())
+}
+
+func TestValidatedHardcoverEditionAcceptsExpectedAuthorRegardlessContributionOrder(t *testing.T) {
+	const (
+		workID        = int64(100)
+		editionID     = int64(301)
+		expectedID    = int64(200)
+		otherAuthorID = int64(201)
+	)
+	authorContribution := func(authorID int64) hardcover.Contributions {
+		return hardcover.Contributions{
+			Contribution: "author",
+			Author: hardcover.ContributionsAuthorAuthors{
+				AuthorInfo: hardcover.AuthorInfo{Id: authorID},
+			},
+		}
+	}
+	expected := authorContribution(expectedID)
+	other := authorContribution(otherAuthorID)
+
+	for name, contributions := range map[string][]hardcover.Contributions{
+		"expected first": {expected, other},
+		"expected last":  {other, expected},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, editionID, validatedHardcoverEdition(
+				workID, editionID, workID, expectedID, contributions,
+			))
+		})
+	}
+
+	assert.Zero(t, validatedHardcoverEdition(
+		workID, editionID, workID, expectedID, []hardcover.Contributions{other},
+	))
+	assert.Equal(t, editionID, validatedHardcoverEdition(
+		workID, editionID, workID, expectedID, []hardcover.Contributions{{
+			Contribution: "narrator",
+			Author: hardcover.ContributionsAuthorAuthors{
+				AuthorInfo: hardcover.AuthorInfo{Id: otherAuthorID},
+			},
+		}},
+	))
+}
+
+func TestHardcoverGetWorkSkipsResolvedCrossWorkDefault(t *testing.T) {
+	const (
+		workID   = int64(100)
+		authorID = int64(200)
+		coverID  = int64(301)
+		ebookID  = int64(302)
+	)
+
+	defaults := testHardcoverDefaults(workID, authorID, coverID, ebookID, 0, 0, 0)
+	editionCalls := 0
+	gql := hardcover.NewMockgql(gomock.NewController(t))
+	gql.EXPECT().MakeRequest(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, req *graphql.Request, resp *graphql.Response) error {
+			switch req.OpName {
+			case "GetWork":
+				data := resp.Data.(*hardcover.GetWorkResponse)
+				data.Books_by_pk.WorkInfo = testHardcoverWork(workID, authorID, defaults)
+				return nil
+			case "GetEdition":
+				editionCalls++
+				editionID := coverID
+				actualWorkID := int64(999)
+				actualDefaults := testHardcoverDefaults(actualWorkID, authorID, coverID, 0, 0, 0, 0)
+				if editionCalls == 2 {
+					editionID = ebookID
+					actualWorkID = workID
+					actualDefaults = defaults
+				}
+
+				data := resp.Data.(*hardcover.GetEditionResponse)
+				data.Editions_by_pk = hardcover.GetEditionEditions_by_pkEditions{
+					EditionInfo: hardcover.EditionInfo{
+						Id:      editionID,
+						Book_id: actualWorkID,
+						Title:   "Cross-work default",
+						Language: hardcover.EditionInfoLanguageLanguages{
+							Code3: "eng",
+						},
+					},
+					Book: hardcover.GetEditionEditions_by_pkEditionsBookBooks{
+						WorkInfo: testHardcoverWork(actualWorkID, authorID, actualDefaults),
+					},
+				}
+				return nil
+			default:
+				return fmt.Errorf("unexpected operation %s", req.OpName)
+			}
+		},
+	).Times(3)
+
+	getter, err := NewHardcoverGetter(newMemoryCache(), gql)
+	require.NoError(t, err)
+	workBytes, gotAuthorID, err := getter.GetWork(t.Context(), workID, nil)
+	require.NoError(t, err)
+	assert.Equal(t, authorID, gotAuthorID)
+	assert.Equal(t, 2, editionCalls)
+
+	var work workResource
+	require.NoError(t, json.Unmarshal(workBytes, &work))
+	assert.Equal(t, workID, work.ForeignID)
+	assert.Zero(t, work.DefaultCoverEditionID)
+	assert.Equal(t, ebookID, work.DefaultEbookEditionID)
+	assert.Equal(t, ebookID, work.BestBookID)
+}
+
+func TestHardcoverGetWorkDoesNotPublishPartialDefaultsAfterTransientFailure(t *testing.T) {
+	const (
+		workID   = int64(100)
+		authorID = int64(200)
+	)
+	transientErr := errors.New("temporary upstream failure")
+	defaults := testHardcoverDefaults(workID, authorID, 301, 302, 0, 0, 0)
+	editionCalls := 0
+	gql := hardcover.NewMockgql(gomock.NewController(t))
+	gql.EXPECT().MakeRequest(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, req *graphql.Request, resp *graphql.Response) error {
+			switch req.OpName {
+			case "GetWork":
+				resp.Data.(*hardcover.GetWorkResponse).Books_by_pk.WorkInfo = testHardcoverWork(workID, authorID, defaults)
+				return nil
+			case "GetEdition":
+				editionCalls++
+				return transientErr
+			default:
+				return fmt.Errorf("unexpected operation %s", req.OpName)
+			}
+		},
+	).Times(2)
+
+	getter, err := NewHardcoverGetter(newMemoryCache(), gql)
+	require.NoError(t, err)
+	_, _, err = getter.GetWork(t.Context(), workID, nil)
+	require.ErrorIs(t, err, transientErr)
+	assert.Equal(t, 1, editionCalls, "a transient failure must not fall through to a partial provider snapshot")
+}
+
+func TestHardcoverGetWorkOverlaysFreshDefaultsOnCachedDefaultEdition(t *testing.T) {
+	const (
+		workID      = int64(100)
+		authorID    = int64(200)
+		coverID     = int64(301)
+		staleBookID = int64(999)
+	)
+
+	cache := newMemoryCache()
+	stale := workResource{
+		CacheSchemaVersion:    workCacheSchemaVersion,
+		ForeignID:             workID,
+		BestBookID:            staleBookID,
+		DefaultCoverEditionID: staleBookID,
+		DefaultEbookEditionID: staleBookID,
+		Authors:               []AuthorResource{{ForeignID: authorID}},
+		Books:                 []bookResource{{ForeignID: coverID, Title: "Cached cover"}},
+	}
+	staleBytes, err := json.Marshal(stale)
+	require.NoError(t, err)
+	cache.Set(t.Context(), BookKey(coverID), staleBytes, time.Hour)
+
+	defaults := testHardcoverDefaults(workID, authorID, coverID, 0, 0, 0, 0)
+	gql := hardcover.NewMockgql(gomock.NewController(t))
+	gql.EXPECT().MakeRequest(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, req *graphql.Request, resp *graphql.Response) error {
+			require.Equal(t, "GetWork", req.OpName)
+			resp.Data.(*hardcover.GetWorkResponse).Books_by_pk.WorkInfo = testHardcoverWork(workID, authorID, defaults)
+			return nil
+		},
+	)
+
+	getter, err := NewHardcoverGetter(cache, gql)
+	require.NoError(t, err)
+	workBytes, _, err := getter.GetWork(t.Context(), workID, nil)
+	require.NoError(t, err)
+
+	var work workResource
+	require.NoError(t, json.Unmarshal(workBytes, &work))
+	assert.Equal(t, coverID, work.BestBookID)
+	assert.Equal(t, coverID, work.DefaultCoverEditionID)
+	assert.Zero(t, work.DefaultEbookEditionID)
+	assert.Zero(t, work.DefaultAudioEditionID)
+	assert.Zero(t, work.DefaultPhysicalEditionID)
+}
+
+func TestHardcoverGetWorkAcceptsSameWorkDefaultsWithMissingEditionContributions(t *testing.T) {
+	const (
+		workID     = int64(100)
+		authorID   = int64(200)
+		coverID    = int64(301)
+		fallbackID = int64(302)
+	)
+
+	cache := newMemoryCache()
+	for _, editionID := range []int64{coverID, fallbackID} {
+		payload, err := json.Marshal(workResource{
+			CacheSchemaVersion: workCacheSchemaVersion,
+			ForeignID:          workID,
+			Authors:            []AuthorResource{{ForeignID: authorID}},
+			Books:              []bookResource{{ForeignID: editionID, Title: "Incomplete contribution edges"}},
+		})
+		require.NoError(t, err)
+		cache.Set(t.Context(), BookKey(editionID), payload, time.Hour)
+	}
+
+	defaults := testHardcoverDefaults(workID, authorID, coverID, 0, 0, 0, fallbackID)
+	defaults.Default_cover_edition.Contributions = nil
+	defaults.Fallback[0].Contributions = nil
+	gql := hardcover.NewMockgql(gomock.NewController(t))
+	gql.EXPECT().MakeRequest(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, req *graphql.Request, resp *graphql.Response) error {
+			require.Equal(t, "GetWork", req.OpName)
+			resp.Data.(*hardcover.GetWorkResponse).Books_by_pk.WorkInfo = testHardcoverWork(workID, authorID, defaults)
+			return nil
+		},
+	)
+
+	getter, err := NewHardcoverGetter(cache, gql)
+	require.NoError(t, err)
+	workBytes, _, err := getter.GetWork(t.Context(), workID, nil)
+	require.NoError(t, err)
+	var work workResource
+	require.NoError(t, json.Unmarshal(workBytes, &work))
+	assert.Equal(t, coverID, work.BestBookID)
+	assert.Equal(t, coverID, work.DefaultCoverEditionID)
+	assert.Contains(t, hardcoverWorkEditionIDs([]workResource{work}), fallbackID)
+}
+
+func TestHardcoverGetWorkRetainsAndPublishesEveryProviderDefault(t *testing.T) {
+	const (
+		workID     = int64(100)
+		authorID   = int64(200)
+		coverID    = int64(301)
+		ebookID    = int64(302)
+		audioID    = int64(303)
+		otherEbook = int64(401)
+	)
+
+	cache := newMemoryCache()
+	coverBytes, err := json.Marshal(workResource{
+		CacheSchemaVersion: workCacheSchemaVersion,
+		ForeignID:          workID,
+		Authors:            []AuthorResource{{ForeignID: authorID}},
+		Books:              []bookResource{{ForeignID: coverID, Title: "Cover"}},
+	})
+	require.NoError(t, err)
+	cache.Set(t.Context(), BookKey(coverID), coverBytes, time.Hour)
+
+	defaults := testHardcoverDefaults(workID, authorID, coverID, ebookID, audioID, 0, 0)
+	edition := func(id int64, format string) hardcover.GetWorkBooks_by_pkBooksEditions {
+		return hardcover.GetWorkBooks_by_pkBooksEditions{EditionInfo: hardcover.EditionInfo{
+			Id:             id,
+			Book_id:        workID,
+			Title:          "Provider Defaults",
+			Edition_format: format,
+			Language: hardcover.EditionInfoLanguageLanguages{
+				Code3: "eng",
+			},
+		}}
+	}
+
+	gql := hardcover.NewMockgql(gomock.NewController(t))
+	gql.EXPECT().MakeRequest(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, req *graphql.Request, resp *graphql.Response) error {
+			require.Equal(t, "GetWork", req.OpName)
+			data := resp.Data.(*hardcover.GetWorkResponse)
+			data.Books_by_pk.WorkInfo = testHardcoverWork(workID, authorID, defaults)
+			data.Books_by_pk.Editions = []hardcover.GetWorkBooks_by_pkBooksEditions{
+				edition(otherEbook, "ebook"), // Same class/title/language as the provider default.
+				edition(ebookID, "ebook"),
+				edition(coverID, "Hardcover"),
+				edition(audioID, "Audiobook"),
+			}
+			return nil
+		},
+	)
+
+	getter, err := NewHardcoverGetter(cache, gql)
+	require.NoError(t, err)
+	var saved []workResource
+	workBytes, _, err := getter.GetWork(t.Context(), workID, func(editions ...workResource) {
+		saved = append(saved, editions...)
+	})
+	require.NoError(t, err)
+
+	var work workResource
+	require.NoError(t, json.Unmarshal(workBytes, &work))
+	assert.Equal(t, coverID, work.DefaultCoverEditionID)
+	assert.Equal(t, ebookID, work.DefaultEbookEditionID)
+	assert.Equal(t, audioID, work.DefaultAudioEditionID)
+	assert.Equal(t, []int64{coverID, ebookID, audioID, otherEbook}, work.ProviderEditionIDs)
+	assert.Subset(t, hardcoverWorkEditionIDs([]workResource{work}), map[int64]struct{}{
+		coverID: {}, ebookID: {}, audioID: {},
+	})
+	assert.Subset(t, hardcoverWorkEditionIDs(saved), map[int64]struct{}{
+		coverID: {}, ebookID: {}, audioID: {},
+	})
+}
+
+func TestHardcoverGetWorkFailsFastWhenMissingDefaultHydrationIsRateLimited(t *testing.T) {
+	const (
+		workID   = int64(100)
+		authorID = int64(200)
+		coverID  = int64(301)
+		audioID  = int64(303)
+	)
+
+	cache := newMemoryCache()
+	coverBytes, err := json.Marshal(workResource{
+		CacheSchemaVersion: workCacheSchemaVersion,
+		ForeignID:          workID,
+		Authors:            []AuthorResource{{ForeignID: authorID}},
+		Books:              []bookResource{{ForeignID: coverID, Title: "Cover"}},
+	})
+	require.NoError(t, err)
+	cache.Set(t.Context(), BookKey(coverID), coverBytes, time.Hour)
+
+	defaults := testHardcoverDefaults(workID, authorID, coverID, 0, audioID, 0, 0)
+	gql := hardcover.NewMockgql(gomock.NewController(t))
+	gql.EXPECT().MakeRequest(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, req *graphql.Request, resp *graphql.Response) error {
+			switch req.OpName {
+			case "GetWork":
+				data := resp.Data.(*hardcover.GetWorkResponse)
+				data.Books_by_pk.WorkInfo = testHardcoverWork(workID, authorID, defaults)
+				data.Books_by_pk.Editions = []hardcover.GetWorkBooks_by_pkBooksEditions{{
+					EditionInfo: hardcover.EditionInfo{
+						Id:             coverID,
+						Book_id:        workID,
+						Title:          "Cover",
+						Edition_format: "Hardcover",
+						Language: hardcover.EditionInfoLanguageLanguages{
+							Code3: "eng",
+						},
+					},
+				}}
+				return nil
+			case "GetEdition":
+				return statusErr(http.StatusTooManyRequests)
+			default:
+				return fmt.Errorf("unexpected operation %s", req.OpName)
+			}
+		},
+	).Times(2)
+
+	getter, err := NewHardcoverGetter(cache, gql)
+	require.NoError(t, err)
+	callbackCalled := false
+	_, _, err = getter.GetWork(t.Context(), workID, func(...workResource) { callbackCalled = true })
+	require.ErrorIs(t, err, statusErr(http.StatusTooManyRequests))
+	assert.False(t, callbackCalled, "a partial provider-default snapshot must never be published")
+}
+
+func TestHardcoverGetBookRejectsInconsistentWorkIdentity(t *testing.T) {
+	const (
+		editionID = int64(301)
+		workID    = int64(100)
+		authorID  = int64(200)
+	)
+
+	gql := hardcover.NewMockgql(gomock.NewController(t))
+	gql.EXPECT().MakeRequest(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, req *graphql.Request, resp *graphql.Response) error {
+			require.Equal(t, "GetEdition", req.OpName)
+			data := resp.Data.(*hardcover.GetEditionResponse)
+			data.Editions_by_pk = hardcover.GetEditionEditions_by_pkEditions{
+				EditionInfo: hardcover.EditionInfo{Id: editionID, Book_id: 999},
+				Book: hardcover.GetEditionEditions_by_pkEditionsBookBooks{
+					WorkInfo: testHardcoverWork(
+						workID,
+						authorID,
+						testHardcoverDefaults(workID, authorID, editionID, 0, 0, 0, 0),
+					),
+				},
+			}
+			return nil
+		},
+	)
+
+	getter, err := NewHardcoverGetter(newMemoryCache(), gql)
+	require.NoError(t, err)
+	_, _, _, err = getter.GetBook(t.Context(), editionID, nil)
+	require.ErrorIs(t, err, errNotFound)
+}
+
+func TestSelectHardcoverEditionsKeepsOrdinaryAndRevisedRepresentatives(t *testing.T) {
+	const (
+		workID   = int64(100)
+		authorID = int64(200)
+	)
+	defaults := testHardcoverDefaults(workID, authorID, 301, 0, 0, 0, 0)
+	work := testHardcoverWork(workID, authorID, defaults)
+	edition := func(id int64, information string) hardcover.GetWorkBooks_by_pkBooksEditions {
+		return hardcover.GetWorkBooks_by_pkBooksEditions{EditionInfo: hardcover.EditionInfo{
+			Id:                  id,
+			Book_id:             workID,
+			Title:               "Same title",
+			Edition_format:      "Hardcover",
+			Edition_information: information,
+			Language: hardcover.EditionInfoLanguageLanguages{
+				Code3: "eng",
+			},
+		}}
+	}
+
+	selected := selectHardcoverEditions(t.Context(), []hardcover.GetWorkBooks_by_pkBooksEditions{
+		edition(401, "Revised edition"), // Higher provider score/order.
+		edition(402, ""),
+		edition(403, ""), // Same ordinary class: bounded away.
+	}, work, nil)
+
+	require.Len(t, selected, 2)
+	assert.Equal(t, int64(401), selected[0].Books[0].ForeignID)
+	assert.Equal(t, int64(402), selected[1].Books[0].ForeignID)
+}
+
+func TestHardcoverMediaTypeContractUsesCaseInsensitiveFormatClassification(t *testing.T) {
+	const (
+		workID    = int64(100)
+		authorID  = int64(200)
+		editionID = int64(301)
+	)
+	defaults := testHardcoverDefaults(workID, authorID, editionID, 0, 0, 0, 0)
+	work := testHardcoverWork(workID, authorID, defaults)
+
+	tests := []struct {
+		format    string
+		mediaType int
+	}{
+		{format: "ebook", mediaType: mediaTypeEbook},
+		{format: "E-Book", mediaType: mediaTypeEbook},
+		{format: "Kindle Edition", mediaType: mediaTypeEbook},
+		{format: "Digital Edition", mediaType: mediaTypeEbook},
+		{format: "EPUB", mediaType: mediaTypeEbook},
+		{format: "MOBI", mediaType: mediaTypeEbook},
+		{format: "PDF", mediaType: mediaTypeEbook},
+		{format: "Audiobook", mediaType: mediaTypeAudiobook},
+		{format: "Audible Audio", mediaType: mediaTypeAudiobook},
+		{format: "Audio CD", mediaType: mediaTypeAudiobook},
+		{format: "MP3 CD", mediaType: mediaTypeAudiobook},
+		{format: "Cassette", mediaType: mediaTypeAudiobook},
+		{format: "Playaway", mediaType: mediaTypeAudiobook},
+		{format: "Hardcover", mediaType: mediaTypeUnknown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.format, func(t *testing.T) {
+			mapped, err := mapHardcoverToWorkResource(t.Context(), hardcover.EditionInfo{
+				Id:             editionID,
+				Book_id:        workID,
+				Title:          "Media type",
+				Edition_format: tt.format,
+				Language: hardcover.EditionInfoLanguageLanguages{
+					Code3: "eng",
+				},
+			}, work)
+			require.NoError(t, err)
+			require.Len(t, mapped.Books, 1)
+			assert.Equal(t, tt.mediaType, mapped.Books[0].MediaType)
+			assert.Equal(t, tt.mediaType == mediaTypeEbook, mapped.Books[0].IsEbook)
+
+			payload, err := json.Marshal(mapped.Books[0])
+			require.NoError(t, err)
+			var wire map[string]any
+			require.NoError(t, json.Unmarshal(payload, &wire))
+			assert.Equal(t, float64(tt.mediaType), wire["MediaType"])
+		})
+	}
+}
+
+func testHardcoverWork(workID, authorID int64, defaults hardcover.DefaultEditions) hardcover.WorkInfo {
+	defaults.Id = workID
+	return hardcover.WorkInfo{
+		Id:              workID,
+		Title:           "Provider Defaults",
+		Description:     "Test work",
+		Slug:            "provider-defaults",
+		DefaultEditions: defaults,
+	}
+}
+
+func testHardcoverDefaults(workID, authorID, coverID, ebookID, audioID, physicalID, fallbackID int64) hardcover.DefaultEditions {
+	author := hardcover.ContributionsAuthorAuthors{AuthorInfo: hardcover.AuthorInfo{Id: authorID}}
+	contribution := hardcover.Contributions{Author: author}
+	defaults := hardcover.DefaultEditions{
+		Id: workID,
+		Contributions: []hardcover.DefaultEditionsContributions{{
+			Contributions: contribution,
+		}},
+	}
+	if coverID != 0 {
+		defaults.Default_cover_edition = hardcover.DefaultEditionsDefault_cover_editionEditions{
+			Id:      coverID,
+			Book_id: workID,
+			Contributions: []hardcover.DefaultEditionsDefault_cover_editionEditionsContributions{{
+				Contributions: contribution,
+			}},
+		}
+	}
+	if ebookID != 0 {
+		defaults.Default_ebook_edition = hardcover.DefaultEditionsDefault_ebook_editionEditions{
+			Id:      ebookID,
+			Book_id: workID,
+			Contributions: []hardcover.DefaultEditionsDefault_ebook_editionEditionsContributions{{
+				Contributions: contribution,
+			}},
+		}
+	}
+	if audioID != 0 {
+		defaults.Default_audio_edition = hardcover.DefaultEditionsDefault_audio_editionEditions{
+			Id:      audioID,
+			Book_id: workID,
+			Contributions: []hardcover.DefaultEditionsDefault_audio_editionEditionsContributions{{
+				Contributions: contribution,
+			}},
+		}
+	}
+	if physicalID != 0 {
+		defaults.Default_physical_edition = hardcover.DefaultEditionsDefault_physical_editionEditions{
+			Id:      physicalID,
+			Book_id: workID,
+			Contributions: []hardcover.DefaultEditionsDefault_physical_editionEditionsContributions{{
+				Contributions: contribution,
+			}},
+		}
+	}
+	if fallbackID != 0 {
+		defaults.Fallback = []hardcover.DefaultEditionsFallbackEditions{{
+			Id:      fallbackID,
+			Book_id: workID,
+			Contributions: []hardcover.DefaultEditionsFallbackEditionsContributions{{
+				Contributions: contribution,
+			}},
+		}}
+	}
+	return defaults
+}
+
+func selectDefaultEditionJSON(t *testing.T, payload []byte) string {
+	t.Helper()
+	var resource map[string]any
+	require.NoError(t, json.Unmarshal(payload, &resource))
+	selected := map[string]any{}
+	for _, field := range []string{
+		"BestBookId",
+		"DefaultCoverEditionId",
+		"DefaultEbookEditionId",
+		"DefaultAudioEditionId",
+		"DefaultPhysicalEditionId",
+	} {
+		selected[field] = resource[field]
+	}
+	out, err := json.Marshal(selected)
+	require.NoError(t, err)
+	return string(out)
+}
+
 func TestHardcoverSearchLimitsHydrationAndPreservesOrder(t *testing.T) {
 	cache := newMemoryCache()
 	ctx := t.Context()
 	ids := []int64{10, 20, 30, 40, 50, 60}
 	for _, id := range ids {
 		bytes, err := json.Marshal(workResource{
-			ForeignID:  id,
-			BestBookID: id + 1000,
-			Authors:    []AuthorResource{{ForeignID: id + 2000}},
+			CacheSchemaVersion: workCacheSchemaVersion,
+			ForeignID:          id,
+			BestBookID:         id + 1000,
+			Authors:            []AuthorResource{{ForeignID: id + 2000}},
 		})
 		require.NoError(t, err)
 		cache.Set(ctx, WorkKey(id), bytes, time.Hour)
@@ -201,6 +827,7 @@ func TestGetBookDataIntegrity(t *testing.T) {
 						  ]`),
 					Cached_image: json.RawMessage("https://assets.hardcover.app/edition/30405274/d41534ce6075b53289d1c4d57a6dac34b974ce91.jpeg"),
 					DefaultEditions: hardcover.DefaultEditions{
+						Id: 141397,
 						Contributions: []hardcover.DefaultEditionsContributions{
 							{
 								Contributions: hardcover.Contributions{
@@ -216,7 +843,8 @@ func TestGetBookDataIntegrity(t *testing.T) {
 							},
 						},
 						Default_cover_edition: hardcover.DefaultEditionsDefault_cover_editionEditions{
-							Id: 30405274,
+							Id:      30405274,
+							Book_id: 141397,
 							Contributions: []hardcover.DefaultEditionsDefault_cover_editionEditionsContributions{
 								{
 									Contributions: hardcover.Contributions{
@@ -255,12 +883,14 @@ func TestGetBookDataIntegrity(t *testing.T) {
 				}
 				ge.Editions_by_pk = hardcover.GetEditionEditions_by_pkEditions{
 					EditionInfo: hardcover.EditionInfo{
-						Id: 30405274,
+						Id:      30405274,
+						Book_id: 141397,
 					},
 					Book: hardcover.GetEditionEditions_by_pkEditionsBookBooks{
 						WorkInfo: hardcover.WorkInfo{
 							Id: 141397,
 							DefaultEditions: hardcover.DefaultEditions{
+								Id: 141397,
 								Contributions: []hardcover.DefaultEditionsContributions{
 									{
 										Contributions: hardcover.Contributions{
@@ -273,7 +903,8 @@ func TestGetBookDataIntegrity(t *testing.T) {
 									},
 								},
 								Default_cover_edition: hardcover.DefaultEditionsDefault_cover_editionEditions{
-									Id: 30405274,
+									Id:      30405274,
+									Book_id: 141397,
 									Contributions: []hardcover.DefaultEditionsDefault_cover_editionEditionsContributions{
 										{
 											Contributions: hardcover.Contributions{
@@ -314,7 +945,9 @@ func TestGetBookDataIntegrity(t *testing.T) {
 								Contribution: "",
 							},
 							Book: hardcover.GetAuthorEditionsAuthors_by_pkAuthorsContributionsBookBooks{
+								Id: 141397,
 								DefaultEditions: hardcover.DefaultEditions{
+									Id: 141397,
 									Contributions: []hardcover.DefaultEditionsContributions{
 										{
 											Contributions: hardcover.Contributions{
@@ -327,7 +960,8 @@ func TestGetBookDataIntegrity(t *testing.T) {
 										},
 									},
 									Default_cover_edition: hardcover.DefaultEditionsDefault_cover_editionEditions{
-										Id: 30405274,
+										Id:      30405274,
+										Book_id: 141397,
 										Contributions: []hardcover.DefaultEditionsDefault_cover_editionEditionsContributions{
 											{
 												Contributions: hardcover.Contributions{
