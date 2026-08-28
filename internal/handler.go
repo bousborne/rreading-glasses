@@ -101,6 +101,9 @@ func NewMux(h *Handler, reg *prometheus.Registry) http.Handler {
 	// Clients retry really aggressively and create thundering herds. Tell them
 	// to back off if we're overloaded.
 	server := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Update the request in place so the outer instrumentation wrapper sees
+		// the route pattern that ServeMux records on this same request object.
+		*r = *r.WithContext(WithInteractivePriority(r.Context()))
 		// Only throttle GET /author.
 		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/author/") {
 			throttled.ServeHTTP(w, r)
@@ -636,9 +639,12 @@ func (*Handler) error(w http.ResponseWriter, err error) {
 	if errors.As(err, &s) {
 		status = s.Status()
 	}
-	if status == http.StatusTooManyRequests {
-		// Readarr understands this header and can back off instead of treating
-		// an exhausted retry budget as a generic metadata-server failure.
+	var retryable interface{ RetryAfter() time.Duration }
+	if errors.As(err, &retryable) {
+		delay := retryable.RetryAfter()
+		seconds := max(1, int((delay+time.Second-1)/time.Second))
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	} else if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
 		w.Header().Set("Retry-After", "30")
 	}
 	http.Error(w, err.Error(), status)
@@ -683,6 +689,8 @@ func (h *Handler) reconfigure(w http.ResponseWriter, r *http.Request) {
 
 	if gr, ok := h.ctrl.getter.(*GRGetter); ok {
 		gql := gr.gql.(*batchedgqlclient)
+		gql.mu.Lock()
+		defer gql.mu.Unlock()
 		if body.BatchSize > 0 {
 			gql.batchSize = body.BatchSize
 			Log(ctx).Warn("set batch size", "size", body.BatchSize)

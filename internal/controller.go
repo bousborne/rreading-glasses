@@ -86,13 +86,46 @@ type Controller struct {
 	refreshG errgroup.Group
 	// refreshC collects author refreshes.
 	refreshC chan refreshAuthor
-	// refreshRetryDelays controls retries for transient upstream failures while
-	// enumerating an author's catalogue. It is a field so tests can avoid
-	// sleeping without weakening production backoff.
-	refreshRetryDelays []time.Duration
 	// authorRefreshRetryDelay controls how long an incomplete catalogue refresh
 	// waits before it is placed back on the worker queue.
 	authorRefreshRetryDelay time.Duration
+	// authorRefreshRetryMax caps exponential retry backoff. A failed refresh is
+	// kept persisted, but it must not continuously consume the upstream quota.
+	authorRefreshRetryMax time.Duration
+	// authorRefreshMaxAttempts pauses an unhealthy author after a bounded number
+	// of complete-catalog attempts. Its durable marker remains available for an
+	// explicit request or a later process restart.
+	authorRefreshMaxAttempts int
+	// authorRecoveryInterval spaces persisted refreshes recovered at startup.
+	// Recovery is intentionally paced so a restart cannot create a request
+	// storm against the metadata provider.
+	authorRecoveryInterval time.Duration
+	// authorRefreshes tracks queued, running, and delayed author refreshes. It
+	// prevents duplicate work from explicit author requests, denormalization
+	// races, and startup recovery.
+	authorRefreshMu sync.Mutex
+	authorRefreshes map[int64]struct{}
+
+	// Run and Shutdown use separate scheduler and worker lifetimes. Shutdown
+	// first stops admitting refresh work, then waits for active workers and a
+	// FIFO denormalization barrier before stopping Run. This prevents completed
+	// refreshes from being stranded in persistence during a normal deployment.
+	lifecycleMu         sync.Mutex
+	runReady            chan struct{}
+	runDone             chan struct{}
+	refreshDispatchDone chan struct{}
+	runCancel           context.CancelFunc
+	schedulerCancel     context.CancelFunc
+	started             bool
+	shutdownOnce        sync.Once
+
+	// denormProducerG tracks request/callback tasks which can enqueue edges.
+	// Admission is closed before Shutdown waits, preventing WaitGroup Add/Wait
+	// races; a nested submission after closure runs inline in its already
+	// tracked parent so no denormalization work is lost.
+	denormProducerMu sync.Mutex
+	denormProducerG  sync.WaitGroup
+	denormAccepting  bool
 
 	// workG collects work refreshes.
 	workG errgroup.Group
@@ -175,9 +208,42 @@ func NewUpstream(host string, proxy string) (*http.Client, error) {
 	return upstream, nil
 }
 
-// NewController creates a new controller. Background jobs to load author works
-// and editions is bounded to at most 10 concurrent tasks.
+type ControllerConfig struct {
+	AuthorRefreshConcurrency int
+	AuthorRefreshRetryBase   time.Duration
+	AuthorRefreshRetryMax    time.Duration
+	AuthorRefreshMaxAttempts int
+	AuthorRecoveryInterval   time.Duration
+}
+
+func DefaultControllerConfig() ControllerConfig {
+	return ControllerConfig{
+		AuthorRefreshConcurrency: 1,
+		AuthorRefreshRetryBase:   time.Hour,
+		AuthorRefreshRetryMax:    24 * time.Hour,
+		AuthorRefreshMaxAttempts: 6,
+		AuthorRecoveryInterval:   5 * time.Minute,
+	}
+}
+
+// NewController creates a controller with conservative refresh defaults.
 func NewController(cache cache[[]byte], getter getter, persister persister, reg *prometheus.Registry) (*Controller, error) {
+	return NewConfiguredController(cache, getter, persister, DefaultControllerConfig(), reg)
+}
+
+// NewConfiguredController creates a controller. Author catalogue refreshes
+// use a dedicated bounded pool, while edition/work maintenance remains
+// independent.
+func NewConfiguredController(cache cache[[]byte], getter getter, persister persister, config ControllerConfig, reg *prometheus.Registry) (*Controller, error) {
+	if config.AuthorRefreshConcurrency <= 0 {
+		return nil, fmt.Errorf("author refresh concurrency must be positive")
+	}
+	if config.AuthorRefreshRetryBase <= 0 || config.AuthorRefreshRetryMax < config.AuthorRefreshRetryBase {
+		return nil, fmt.Errorf("author refresh retry range is invalid")
+	}
+	if config.AuthorRefreshMaxAttempts <= 0 || config.AuthorRecoveryInterval <= 0 {
+		return nil, fmt.Errorf("author refresh attempts and recovery interval must be positive")
+	}
 	metrics := newControllerMetrics(reg)
 	c := &Controller{
 		cache:     cache,
@@ -188,14 +254,25 @@ func NewController(cache cache[[]byte], getter getter, persister persister, reg 
 		denormC:  make(chan edge),
 		refreshC: make(chan refreshAuthor),
 
-		refreshRetryDelays:      []time.Duration{time.Second, 5 * time.Second, 15 * time.Second},
-		authorRefreshRetryDelay: time.Minute,
+		authorRefreshRetryDelay:  config.AuthorRefreshRetryBase,
+		authorRefreshRetryMax:    config.AuthorRefreshRetryMax,
+		authorRefreshMaxAttempts: config.AuthorRefreshMaxAttempts,
+		authorRecoveryInterval:   config.AuthorRecoveryInterval,
+		authorRefreshes:          make(map[int64]struct{}),
+		runReady:                 make(chan struct{}),
+		runDone:                  make(chan struct{}),
+		refreshDispatchDone:      make(chan struct{}),
+		denormAccepting:          true,
 	}
 	if persister != nil {
 		c.persister = persister
 	}
 
-	c.refreshG.SetLimit(30)
+	// Author refreshes expand into many book/work lookups. Keep them strictly
+	// serialized; the GraphQL batching layer still handles individual request
+	// throughput, while this limit prevents catalogue crawls from multiplying
+	// that load.
+	c.refreshG.SetLimit(config.AuthorRefreshConcurrency)
 	c.workG.SetLimit(25) // Sure why not.
 
 	return c, nil
@@ -261,6 +338,7 @@ func (c *Controller) Recommendations(ctx context.Context, page int64) (Recomment
 	for _, workID := range recs.WorkIDs {
 		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			_, _, err := c.GetWork(ctx, workID)
 			if err != nil {
 				return
@@ -270,6 +348,7 @@ func (c *Controller) Recommendations(ctx context.Context, page int64) (Recomment
 			workIDs = append(workIDs, workID)
 		}()
 	}
+	wg.Wait()
 	recs.WorkIDs = workIDs
 	return recs, nil
 }
@@ -338,6 +417,27 @@ func (c *Controller) GetWork(ctx context.Context, workID int64) ([]byte, time.Du
 // GetAuthor loads an author or returns a cached value if one exists.
 func (c *Controller) GetAuthor(ctx context.Context, authorID int64) ([]byte, time.Duration, error) {
 	// The "unknown author" ID is never loadable, so we can short-circuit.
+	if unknownAuthor(authorID) {
+		return nil, _missingTTL, errNotFound
+	}
+	p, err, _ := c.group.Do(AuthorKey(authorID), func() (any, error) {
+		return c.getAuthor(ctx, authorID)
+	})
+	pair := p.(ttlpair)
+	if err == nil {
+		// A shallow lookup may have won the singleflight race. Scheduling after
+		// the shared call guarantees that an explicit author request still starts
+		// exactly one full catalogue refresh.
+		c.queueAuthorRefreshIfNeeded(ctx, authorID, pair.bytes)
+	}
+	return pair.bytes, pair.ttl, err
+}
+
+// getAuthorForDenormalization loads enough author data to maintain cache
+// relationships without starting a full catalogue crawl. A subsequent
+// explicit GetAuthor call observes the refresh-needed marker and schedules the
+// normal background refresh.
+func (c *Controller) getAuthorForDenormalization(ctx context.Context, authorID int64) ([]byte, time.Duration, error) {
 	if unknownAuthor(authorID) {
 		return nil, _missingTTL, errNotFound
 	}
@@ -447,7 +547,7 @@ func (c *Controller) getBook(ctx context.Context, bookID int64) (ttlpair, error)
 
 	if workID > 0 {
 		// Ensure the edition/book is included with the work, but don't block the response.
-		go func() {
+		c.submitDenormTask(func() {
 			// Decouple our context from the request.
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 			defer cancel()
@@ -455,7 +555,7 @@ func (c *Controller) getBook(ctx context.Context, bookID int64) (ttlpair, error)
 				Log(ctx).Warn("skipping work denorm due to error", "bookID", bookID, "workID", workID, "err", err)
 				return
 			}
-			if _, _, err := c.GetAuthor(ctx, authorID); err != nil { // Ensure fetched.
+			if _, _, err := c.getAuthorForDenormalization(ctx, authorID); err != nil { // Ensure fetched without crawling.
 				if errors.Is(err, errNotFound) {
 					// Something's not right -- we know this author must exist
 					// because the work belongs to it, but we have a 404
@@ -464,15 +564,18 @@ func (c *Controller) getBook(ctx context.Context, bookID int64) (ttlpair, error)
 					// a good state.
 					Log(ctx).Warn("force refreshing author due to unexpected 404", "bookID", bookID, "authorID", authorID)
 					_ = c.cache.Expire(ctx, AuthorKey(authorID))
-					_ = c.persister.Delete(ctx, authorID)
-					_, _, _ = c.GetAuthor(ctx, authorID)
+					_, _, err = c.getAuthorForDenormalization(ctx, authorID)
+					if err != nil {
+						Log(ctx).Warn("skipping author denorm after forced refresh failed", "bookID", bookID, "authorID", authorID, "err", err)
+						return
+					}
 				} else {
 					Log(ctx).Warn("skipping author denorm due to error", "bookID", bookID, "authorID", authorID, "err", err)
 					return
 				}
 			}
-			c.denormC <- edge{kind: workEdge, parentID: workID, childIDs: newSet(bookID)}
-		}()
+			_ = c.enqueueDenorm(ctx, edge{kind: workEdge, parentID: workID, childIDs: newSet(bookID)})
+		})
 	}
 
 	return ttlpair{bytes: workBytes, ttl: ttl}, nil
@@ -501,41 +604,42 @@ func (c *Controller) getWork(ctx context.Context, workID int64) (ttlpair, error)
 	ttl = fuzz(_workTTL, 1.5)
 	c.cache.Set(ctx, WorkKey(workID), workBytes, ttl)
 
-	// Ensuring relationships doesn't block.
-	go func() {
-		c.workG.Go(func() error {
-			ctx := context.WithValue(context.Background(), middleware.RequestIDKey, fmt.Sprintf("refresh-work-%d", workID))
+	// Submit relationship maintenance to the bounded pool before returning.
+	// Group.Go returns immediately while capacity is available and applies
+	// deliberate backpressure at the configured limit; there is no untracked
+	// dispatcher goroutine that can race Shutdown's workG.Wait.
+	c.workG.Go(func() error {
+		ctx := context.WithValue(context.Background(), middleware.RequestIDKey, fmt.Sprintf("refresh-work-%d", workID))
 
-			defer func() {
-				if r := recover(); r != nil {
-					Log(ctx).Error("panic", "details", r)
-				}
-			}()
-
-			// Ensure we keep whatever editions we already had cached.
-			var cached workResource
-			_ = json.Unmarshal(cachedBytes, &cached)
-
-			cachedBookIDs := []int64{}
-			for _, b := range cached.Books {
-				if _, _, err := c.GetBook(ctx, b.ForeignID); err == nil { // Ensure fetched.
-					cachedBookIDs = append(cachedBookIDs, b.ForeignID)
-				}
+		defer func() {
+			if r := recover(); r != nil {
+				Log(ctx).Error("panic", "details", r)
 			}
+		}()
 
-			if authorID > 0 {
-				_, _, _ = c.GetAuthor(ctx, authorID) // Ensure fetched.
+		// Ensure we keep whatever editions we already had cached.
+		var cached workResource
+		_ = json.Unmarshal(cachedBytes, &cached)
+
+		cachedBookIDs := []int64{}
+		for _, b := range cached.Books {
+			if _, _, err := c.GetBook(ctx, b.ForeignID); err == nil { // Ensure fetched.
+				cachedBookIDs = append(cachedBookIDs, b.ForeignID)
 			}
+		}
 
-			c.denormC <- edge{kind: workEdge, parentID: workID, childIDs: newSet(cachedBookIDs...)}
+		if authorID > 0 {
+			_, _, _ = c.getAuthorForDenormalization(ctx, authorID) // Ensure fetched without crawling.
+		}
 
-			if authorID > 0 {
-				// Ensure the work belongs to its author.
-				c.denormC <- edge{kind: authorEdge, parentID: authorID, childIDs: newSet(workID)}
-			}
-			return nil
-		})
-	}()
+		_ = c.enqueueDenorm(ctx, edge{kind: workEdge, parentID: workID, childIDs: newSet(cachedBookIDs...)})
+
+		if authorID > 0 {
+			// Ensure the work belongs to its author.
+			_ = c.enqueueDenorm(ctx, edge{kind: authorEdge, parentID: authorID, childIDs: newSet(workID)})
+		}
+		return nil
+	})
 
 	// Return the last cached value to give the refresh time to complete.
 	if len(cachedBytes) > 0 {
@@ -573,7 +677,7 @@ func (c *Controller) getSeries(ctx context.Context, seriesID int64) ([]byte, err
 }
 
 func (c *Controller) saveEditions(grBooks ...workResource) {
-	go func() {
+	c.submitDenormTask(func() {
 		ctx := context.WithValue(context.Background(), middleware.RequestIDKey, fmt.Sprintf("save-editions-%d", time.Now().Unix()))
 
 		var grWorkID int64
@@ -598,9 +702,6 @@ func (c *Controller) saveEditions(grBooks ...workResource) {
 				continue
 			}
 			authorID := w.Authors[0].ForeignID
-			if _, _, err := c.GetAuthor(ctx, authorID); err != nil { // Ensure fetched.
-				continue
-			}
 
 			if len(w.Books) == 0 {
 				Log(ctx).Warn("missing books", "workID", w.ForeignID)
@@ -640,8 +741,8 @@ func (c *Controller) saveEditions(grBooks ...workResource) {
 			return // Shouldn't happen.
 		}
 
-		c.denormC <- edge{kind: workEdge, parentID: grWorkID, childIDs: newSet(grBookIDs...)}
-	}()
+		_ = c.enqueueDenorm(ctx, edge{kind: workEdge, parentID: grWorkID, childIDs: newSet(grBookIDs...)})
+	})
 }
 
 // getAuthor returns an AuthorResource with up to 20 works populated on first
@@ -680,6 +781,10 @@ func (c *Controller) getAuthor(ctx context.Context, authorID int64) (ttlpair, er
 	}
 
 	ttl = fuzz(_authorTTL, 1.5)
+	// Publish the durable refresh-needed marker before making a shallow author
+	// record visible. An explicit request racing this load can therefore never
+	// mistake the shallow record for a completed catalogue refresh.
+	c.cache.Set(ctx, authorRefreshNeededKey(authorID), []byte{1}, 365*24*time.Hour)
 	c.cache.Set(ctx, AuthorKey(authorID), authorBytes, ttl)
 
 	// From here we'll prefer to use the last-known state. If this is the first
@@ -689,14 +794,6 @@ func (c *Controller) getAuthor(ctx context.Context, authorID int64) (ttlpair, er
 		cachedBytes = authorBytes
 	}
 
-	// Mark the author as being refreshed by recording its last known state.
-	if err := c.persister.Persist(ctx, authorID, cachedBytes); err != nil {
-		Log(ctx).Warn("problem persisting refresh", "err", err)
-	}
-
-	// Kick off a refresh but don't block on it.
-	c.refreshC <- refreshAuthor{id: authorID, state: cachedBytes}
-
 	// Return the last cached value to give the refresh time to complete.
 	return ttlpair{bytes: cachedBytes, ttl: ttl}, nil
 }
@@ -705,37 +802,166 @@ type refreshAuthor struct {
 	id      int64
 	state   []byte
 	isRetry bool
+	attempt int
 }
 
-func (c *Controller) refreshAuthor(ctx context.Context, authorID int64, cachedBytes []byte) {
-	ctx = context.WithValue(ctx, middleware.RequestIDKey, fmt.Sprintf("refresh-author-%d", authorID))
+func authorRefreshNeededKey(authorID int64) string {
+	return fmt.Sprintf("arn%d", authorID)
+}
 
-	defer func() {
-		if r := recover(); r != nil {
-			Log(ctx).Error("panic", "details", r)
-		}
-	}()
+func (c *Controller) claimAuthorRefresh(authorID int64) bool {
+	c.authorRefreshMu.Lock()
+	defer c.authorRefreshMu.Unlock()
+	if _, ok := c.authorRefreshes[authorID]; ok {
+		return false
+	}
+	c.authorRefreshes[authorID] = struct{}{}
+	return true
+}
 
-	if !c.refreshAuthorOnce(ctx, authorID) {
-		Log(ctx).Warn("author refresh incomplete; keeping it pending for retry", "authorID", authorID, "retryIn", c.authorRefreshRetryDelay.String())
-		go func() {
-			timer := time.NewTimer(c.authorRefreshRetryDelay)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				return
-			case <-timer.C:
-			}
+func (c *Controller) releaseAuthorRefresh(authorID int64) {
+	c.authorRefreshMu.Lock()
+	delete(c.authorRefreshes, authorID)
+	c.authorRefreshMu.Unlock()
+}
 
-			select {
-			case <-ctx.Done():
-			case c.refreshC <- refreshAuthor{id: authorID, state: cachedBytes, isRetry: true}:
-			}
-		}()
+func (c *Controller) enqueueAuthorRefresh(ctx context.Context, refresh refreshAuthor) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case c.refreshC <- refresh:
+		return true
+	}
+}
+
+func (c *Controller) queueAuthorRefreshIfNeeded(ctx context.Context, authorID int64, state []byte) {
+	if _, needed := c.cache.Get(ctx, authorRefreshNeededKey(authorID)); !needed {
+		return
+	}
+	if !c.claimAuthorRefresh(authorID) {
 		return
 	}
 
-	c.denormC <- edge{kind: refreshDone, parentID: authorID}
+	// Persist before enqueueing so a shutdown at any point after this can be
+	// recovered safely. Leave the refresh-needed marker intact on failure.
+	if err := c.persister.Persist(ctx, authorID, state); err != nil {
+		c.releaseAuthorRefresh(authorID)
+		Log(ctx).Warn("problem persisting refresh", "authorID", authorID, "err", err)
+		return
+	}
+	// Hold the scheduler lock through admission and marker removal. This makes
+	// acceptance atomic with respect to refresh completion releasing the claim:
+	// the durable marker is cleared only after the job has been accepted, and a
+	// second explicit request cannot slip through if the first job is very fast.
+	c.authorRefreshMu.Lock()
+	select {
+	case <-ctx.Done():
+		delete(c.authorRefreshes, authorID)
+		c.authorRefreshMu.Unlock()
+		return
+	case c.refreshC <- refreshAuthor{id: authorID, state: state}:
+	}
+	if err := c.cache.Delete(ctx, authorRefreshNeededKey(authorID)); err != nil {
+		Log(ctx).Warn("problem deleting author refresh-needed marker", "authorID", authorID, "err", err)
+	}
+	c.authorRefreshMu.Unlock()
+}
+
+func (c *Controller) authorRefreshBackoff(attempt int) time.Duration {
+	delay := c.authorRefreshRetryDelay
+	if delay <= 0 {
+		return 0
+	}
+	if c.authorRefreshRetryMax <= 0 {
+		return delay
+	}
+	for i := 0; i < attempt && delay < c.authorRefreshRetryMax; i++ {
+		if delay > c.authorRefreshRetryMax/2 {
+			return c.authorRefreshRetryMax
+		}
+		delay *= 2
+	}
+	if delay > c.authorRefreshRetryMax {
+		return c.authorRefreshRetryMax
+	}
+	return delay
+}
+
+func (c *Controller) refreshAuthor(workerCtx, schedulerCtx context.Context, refresh refreshAuthor) {
+	authorID := refresh.id
+	workerCtx = context.WithValue(workerCtx, middleware.RequestIDKey, fmt.Sprintf("refresh-author-%d", authorID))
+	schedulerCtx = context.WithValue(schedulerCtx, middleware.RequestIDKey, fmt.Sprintf("retry-author-%d", authorID))
+
+	defer func() {
+		if r := recover(); r != nil {
+			panicErr := fmt.Errorf("panic refreshing author %d: %v", authorID, r)
+			Log(workerCtx).Error("panic", "details", r)
+			c.scheduleAuthorRefreshRetry(schedulerCtx, refresh, panicErr)
+		}
+	}()
+
+	complete, cause := c.refreshAuthorAttempt(workerCtx, authorID)
+	if !complete {
+		c.scheduleAuthorRefreshRetry(schedulerCtx, refresh, cause)
+		return
+	}
+
+	_ = c.enqueueDenorm(workerCtx, edge{kind: refreshDone, parentID: authorID})
+}
+
+func (c *Controller) authorRefreshRetryPlan(refresh refreshAuthor, cause error) (int, time.Duration) {
+	nextAttempt := refresh.attempt + 1
+	delay := c.authorRefreshBackoff(refresh.attempt)
+
+	// A provider cooldown is admission control, not a failed catalogue attempt.
+	// Preserve the attempt budget and honor the absolute Retry-After deadline.
+	var rateLimit *RateLimitError
+	if errors.As(cause, &rateLimit) {
+		nextAttempt = refresh.attempt
+		delay = max(delay, rateLimit.RetryAfter())
+	} else if rateLimitedRefreshError(cause) {
+		// A bare typed 429 has no deadline. Keep the attempt budget and use the
+		// controller's conservative retry floor rather than retrying immediately.
+		nextAttempt = refresh.attempt
+	}
+
+	return nextAttempt, delay
+}
+
+func (c *Controller) scheduleAuthorRefreshRetry(ctx context.Context, refresh refreshAuthor, cause error) {
+	nextAttempt, delay := c.authorRefreshRetryPlan(refresh, cause)
+	if c.authorRefreshMaxAttempts > 0 && nextAttempt >= c.authorRefreshMaxAttempts {
+		Log(ctx).Error("author refresh paused after repeated incomplete attempts",
+			"authorID", refresh.id,
+			"attempts", nextAttempt,
+			"err", cause)
+		c.cache.Set(ctx, authorRefreshNeededKey(refresh.id), []byte{1}, 365*24*time.Hour)
+		c.releaseAuthorRefresh(refresh.id)
+		c.metrics.refreshWaitingAdd(-1)
+		return
+	}
+	Log(ctx).Warn("author refresh incomplete; keeping it pending for retry",
+		"authorID", refresh.id,
+		"attempt", nextAttempt,
+		"retryIn", delay.String(),
+		"err", cause)
+	if ctx.Err() != nil {
+		return
+	}
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+
+		select {
+		case <-ctx.Done():
+		case c.refreshC <- refreshAuthor{id: refresh.id, state: refresh.state, isRetry: true, attempt: nextAttempt}:
+		}
+	}()
 }
 
 // refreshAuthorOnce fetches one complete snapshot of an author's catalogue.
@@ -743,17 +969,27 @@ func (c *Controller) refreshAuthor(ctx context.Context, authorID int64, cachedBy
 // partial snapshot is still denormalized so successful work is not discarded,
 // but the persisted refresh marker is retained until a later attempt succeeds.
 func (c *Controller) refreshAuthorOnce(ctx context.Context, authorID int64) bool {
+	complete, _ := c.refreshAuthorAttempt(ctx, authorID)
+	return complete
+}
+
+// refreshAuthorAttempt returns the first error which made the snapshot
+// incomplete. The scheduler uses typed RateLimitError deadlines to avoid both
+// consuming retry budget and waking before Hardcover's cooldown expires.
+func (c *Controller) refreshAuthorAttempt(ctx context.Context, authorID int64) (bool, error) {
 	Log(ctx).Info("fetching all works for author", "authorID", authorID)
 
 	n := 0
 	start := time.Now()
 	workIDSToDenormalize := []int64{}
 	complete := true
+	var incompleteCause error
 
 	for bookID, listErr := range c.getter.GetAuthorBooks(ctx, authorID) {
 		if listErr != nil {
 			Log(ctx).Warn("problem enumerating books for author", "authorID", authorID, "err", listErr)
 			complete = false
+			incompleteCause = listErr
 			break
 		}
 		if n > 1000 {
@@ -761,22 +997,24 @@ func (c *Controller) refreshAuthorOnce(ctx context.Context, authorID int64) bool
 			break // Some authors (e.g. Wikipedia) have an obscene number of works. Give up.
 		}
 
+		bookBytes, _, err := c.GetBook(ctx, bookID)
 		var w workResource
-		err := c.retryRefreshCall(ctx, func() error {
-			bookBytes, _, err := c.GetBook(ctx, bookID)
-			if err != nil {
-				return err
-			}
-			if err := json.Unmarshal(bookBytes, &w); err != nil {
+		if err == nil {
+			if unmarshalErr := json.Unmarshal(bookBytes, &w); unmarshalErr != nil {
 				_ = c.cache.Expire(ctx, BookKey(bookID))
-				return fmt.Errorf("unmarshaling book %d: %w", bookID, err)
+				err = fmt.Errorf("unmarshaling book %d: %w", bookID, unmarshalErr)
 			}
-			return nil
-		})
+		}
 		if err != nil {
 			Log(ctx).Warn("problem getting book for author", "authorID", authorID, "bookID", bookID, "err", err)
-			if ctx.Err() != nil || retryableRefreshError(ctx, err) {
+			if refreshAttemptIncomplete(ctx, err) {
 				complete = false
+				if incompleteCause == nil || rateLimitedRefreshError(err) {
+					incompleteCause = err
+				}
+			}
+			if rateLimitedRefreshError(err) {
+				break
 			}
 			continue
 		}
@@ -787,16 +1025,19 @@ func (c *Controller) refreshAuthorOnce(ctx context.Context, authorID int64) bool
 		}
 
 		workID := w.ForeignID
-		err = c.retryRefreshCall(ctx, func() error {
-			_, _, err := c.GetWork(ctx, workID)
-			return err
-		})
+		_, _, err = c.GetWork(ctx, workID)
 		if err == nil { // Ensure fetched before denormalizing.
 			workIDSToDenormalize = append(workIDSToDenormalize, workID)
 		} else {
 			Log(ctx).Warn("problem getting work for author", "authorID", authorID, "bookID", bookID, "workID", workID, "err", err)
-			if ctx.Err() != nil || retryableRefreshError(ctx, err) {
+			if refreshAttemptIncomplete(ctx, err) {
 				complete = false
+				if incompleteCause == nil || rateLimitedRefreshError(err) {
+					incompleteCause = err
+				}
+			}
+			if rateLimitedRefreshError(err) {
+				break
 			}
 		}
 		n++
@@ -806,95 +1047,183 @@ func (c *Controller) refreshAuthorOnce(ctx context.Context, authorID int64) bool
 	workIDSToDenormalize = slices.Compact(workIDSToDenormalize)
 
 	if len(workIDSToDenormalize) > 0 {
-		c.denormC <- edge{kind: authorEdge, parentID: authorID, childIDs: newSet(workIDSToDenormalize...)}
+		_ = c.enqueueDenorm(ctx, edge{kind: authorEdge, parentID: authorID, childIDs: newSet(workIDSToDenormalize...)})
 	}
 	Log(ctx).Info("finished author refresh attempt", "authorID", authorID, "count", len(workIDSToDenormalize), "complete", complete, "duration", time.Since(start).String())
-	return complete
+	return complete, incompleteCause
 }
 
-func (c *Controller) retryRefreshCall(ctx context.Context, call func() error) error {
-	err := call()
-	for _, delay := range c.refreshRetryDelays {
-		if err == nil || !retryableRefreshError(ctx, err) {
-			return err
-		}
-
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return errors.Join(err, ctx.Err())
-		case <-timer.C:
-		}
-		err = call()
-	}
-	return err
+func rateLimitedRefreshError(err error) bool {
+	return errors.Is(err, statusErr(http.StatusTooManyRequests))
 }
 
-func retryableRefreshError(ctx context.Context, err error) bool {
-	if err == nil || ctx.Err() != nil {
+func refreshAttemptIncomplete(_ context.Context, err error) bool {
+	if err == nil || errors.Is(err, errNotFound) {
 		return false
 	}
+	// Non-transient failures are not retried immediately, but they still mean
+	// this catalogue snapshot was incomplete. The outer bounded scheduler will
+	// retain the durable marker and eventually pause instead of publishing a
+	// partial author as complete.
+	return true
+}
 
-	var status statusErr
-	if !errors.As(err, &status) {
-		// Network and malformed-response errors do not carry an HTTP status and
-		// are generally safe to retry during a background refresh.
+func (c *Controller) enqueueDenorm(ctx context.Context, edge edge) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case c.denormC <- edge:
 		return true
 	}
+}
 
-	code := status.Status()
-	return code == http.StatusRequestTimeout || code == http.StatusTooEarly || code == http.StatusTooManyRequests || code >= 500
+func (c *Controller) submitDenormTask(task func()) {
+	c.denormProducerMu.Lock()
+	if !c.denormAccepting {
+		c.denormProducerMu.Unlock()
+		// Shutdown has stopped new detached tasks. Execute nested work inline so
+		// the caller that Shutdown is already waiting on owns its completion.
+		task()
+		return
+	}
+	c.denormProducerG.Add(1)
+	c.denormProducerMu.Unlock()
+
+	go func() {
+		defer c.denormProducerG.Done()
+		task()
+	}()
+}
+
+func (c *Controller) stopAndWaitDenormProducers(ctx context.Context) bool {
+	c.denormProducerMu.Lock()
+	c.denormAccepting = false
+	c.denormProducerMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		c.denormProducerG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// drainDenormalization uses two consecutive FIFO barriers. The second catches
+// any synchronous child edge produced while Run was processing an edge ahead
+// of the first barrier (workEdge can produce authorEdge).
+func (c *Controller) drainDenormalization(ctx context.Context) bool {
+	for range 2 {
+		barrier := edge{kind: drainEdge, done: make(chan struct{})}
+		select {
+		case c.denormC <- barrier:
+		case <-ctx.Done():
+			return false
+		}
+		select {
+		case <-barrier.done:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return true
 }
 
 // Run is responsible for denormalizing data and handling our worker pools.
-func (c *Controller) Run(ctx context.Context) {
+// Cancellation of the caller's context does not tear down consumers
+// immediately. The owner must call Shutdown, which performs an ordered drain.
+func (c *Controller) Run(parent context.Context) {
+	c.lifecycleMu.Lock()
+	if c.started {
+		done := c.runDone
+		c.lifecycleMu.Unlock()
+		<-done
+		return
+	}
+	c.started = true
+	runCtx, runCancel := context.WithCancel(context.WithoutCancel(parent))
+	schedulerCtx, schedulerCancel := context.WithCancel(runCtx)
+	c.runCancel = runCancel
+	c.schedulerCancel = schedulerCancel
+	close(c.runReady)
+	c.lifecycleMu.Unlock()
+	defer close(c.runDone)
+
 	// Log controller stats every minute.
 	go func() {
-		ctx := context.WithValue(ctx, middleware.RequestIDKey, "stats")
+		ctx := context.WithValue(runCtx, middleware.RequestIDKey, "stats")
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
 		for {
-			time.Sleep(1 * time.Minute)
-			Log(ctx).Debug("controller stats",
-				"refreshWaiting", c.metrics.refreshWaitingGet(),
-				"denormWaiting", c.metrics.denormWaitingGet(),
-				"etagMatches", c.metrics.etagMatchesGet(),
-				"etagRatio", c.metrics.etagRatioGet(),
-			)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				Log(ctx).Debug("controller stats",
+					"refreshWaiting", c.metrics.refreshWaitingGet(),
+					"denormWaiting", c.metrics.denormWaitingGet(),
+					"etagMatches", c.metrics.etagMatchesGet(),
+					"etagRatio", c.metrics.etagRatioGet(),
+				)
+			}
 		}
 	}()
 
 	// Retry any author refreshes that were in-flight when we last shut down.
 	go func() {
-		ctx := context.WithValue(ctx, middleware.RequestIDKey, "recovery")
+		ctx := context.WithValue(schedulerCtx, middleware.RequestIDKey, "recovery")
 		authorIDs, err := c.persister.Persisted(ctx)
 		if err != nil {
 			Log(ctx).Error("problem retrying in-flight refreshes", "err", err)
 		}
-		for _, authorID := range authorIDs {
+		for i, authorID := range authorIDs {
+			if !c.claimAuthorRefresh(authorID) {
+				continue
+			}
 			Log(ctx).Debug("resuming author refresh", "authorID", authorID)
-			c.refreshC <- refreshAuthor{id: authorID}
+			if !c.enqueueAuthorRefresh(ctx, refreshAuthor{id: authorID}) {
+				c.releaseAuthorRefresh(authorID)
+				return
+			}
+
+			if i == len(authorIDs)-1 {
+				continue
+			}
+			timer := time.NewTimer(c.authorRecoveryInterval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
 	}()
 
 	// Hand author refreshes to the bounded worker pool.
-	refreshes := accumulate(c.refreshC, &slicebuffer[refreshAuthor]{})
+	refreshes := accumulateWithContext(schedulerCtx, c.refreshC, &slicebuffer[refreshAuthor]{})
 	go func() {
-		ctx := context.WithValue(ctx, middleware.RequestIDKey, "refresh")
+		defer close(c.refreshDispatchDone)
+		workerCtx := context.WithValue(runCtx, middleware.RequestIDKey, "refresh")
+		retryCtx := context.WithValue(schedulerCtx, middleware.RequestIDKey, "refresh-retry")
 		for r := range refreshes {
 			if !r.isRetry {
 				c.metrics.refreshWaitingAdd(1)
 			}
 			c.refreshG.Go(func() error {
-				c.refreshAuthor(ctx, r.id, r.state)
+				c.refreshAuthor(workerCtx, retryCtx, r)
 				return nil
 			})
 		}
 	}()
 
 	denormBuf := &edgebuf{}
-	denorms := accumulate(c.denormC, denormBuf)
+	denorms := accumulateWithContext(runCtx, c.denormC, denormBuf)
 	for edge := range denorms {
-		ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+		ctx, cancel := context.WithTimeout(runCtx, 1*time.Minute)
 		ctx = context.WithValue(ctx, middleware.RequestIDKey, fmt.Sprintf("denorm-%d-%d", edge.kind, edge.parentID))
 
 		switch edge.kind {
@@ -913,22 +1242,102 @@ func (c *Controller) Run(ctx context.Context) {
 			c.metrics.refreshWaitingAdd(-1)
 			if err := c.persister.Delete(ctx, edge.parentID); err != nil {
 				Log(ctx).Warn("problem un-persisting refresh", "err", err)
+			} else {
+				if err := c.cache.Delete(ctx, authorRefreshNeededKey(edge.parentID)); err != nil {
+					Log(ctx).Warn("problem deleting stale author refresh-needed marker", "authorID", edge.parentID, "err", err)
+				}
+				c.releaseAuthorRefresh(edge.parentID)
 			}
+		case drainEdge:
+			close(edge.done)
 		}
 		cancel()
 		c.metrics.denormWaitingSet(denormBuf.len())
 	}
 }
 
-// Shutdown waits for all refresh and denormalization goroutines to finish
-// submitting their work and then closes the denormalization channel. Run will
-// run to completion after Shutdown is called.
+// Shutdown stops refresh admission, waits for active refresh and work pools,
+// drains all submitted denormalization edges through a FIFO barrier, and then
+// stops Run. A canceled shutdown context forces Run to stop while leaving any
+// incomplete refresh persisted for recovery on the next start.
 func (c *Controller) Shutdown(ctx context.Context) {
-	// _ = c.refreshG.Wait()
-	//
-	//	for c.denormWaiting.Load() > 0 {
-	//		time.Sleep(1 * time.Second)
-	//	}
+	select {
+	case <-c.runReady:
+	case <-ctx.Done():
+		return
+	}
+
+	c.shutdownOnce.Do(func() {
+		c.lifecycleMu.Lock()
+		schedulerCancel := c.schedulerCancel
+		runCancel := c.runCancel
+		c.lifecycleMu.Unlock()
+
+		// Phase one: stop recovery and delayed retries, then wait until the
+		// dispatcher cannot add more jobs to refreshG.
+		schedulerCancel()
+		select {
+		case <-c.refreshDispatchDone:
+		case <-ctx.Done():
+			runCancel()
+			return
+		}
+
+		refreshDone := make(chan struct{})
+		go func() {
+			_ = c.refreshG.Wait()
+			close(refreshDone)
+		}()
+		select {
+		case <-refreshDone:
+		case <-ctx.Done():
+			runCancel()
+			return
+		}
+
+		// No HTTP handlers remain when the production owner calls Shutdown and
+		// refreshG is now idle. Close detached denormalization admission and wait
+		// for every already-admitted producer (getBook/saveEditions) to finish.
+		if !c.stopAndWaitDenormProducers(ctx) {
+			runCancel()
+			return
+		}
+
+		// The first barrier processes refresh/producer edges. Processing an
+		// author edge may itself admit bounded workG maintenance, so this barrier
+		// must precede workG.Wait.
+		if !c.drainDenormalization(ctx) {
+			runCancel()
+			return
+		}
+
+		// Wait for work spawned by those drained edges.
+		workDone := make(chan struct{})
+		go func() {
+			_ = c.workG.Wait()
+			close(workDone)
+		}()
+		select {
+		case <-workDone:
+		case <-ctx.Done():
+			runCancel()
+			return
+		}
+
+		// The second barrier drains workG-produced edges and their synchronous
+		// child edges, including refreshDone persistence cleanup, before Run is
+		// canceled.
+		if !c.drainDenormalization(ctx) {
+			runCancel()
+			return
+		}
+
+		runCancel()
+		select {
+		case <-c.runDone:
+		case <-ctx.Done():
+		}
+	})
 }
 
 // denormalizeEditions ensures that the given editions exists on the work. It
@@ -1029,11 +1438,11 @@ func (c *Controller) denormalizeEditions(ctx context.Context, workID int64, book
 
 	// We modified the work, so the author also needs to be updated. Remove the
 	// relationship so it doesn't no-op during the denormalization.
-	go func() {
-		for _, author := range work.Authors {
-			c.denormC <- edge{kind: authorEdge, parentID: author.ForeignID, childIDs: newSet(workID)}
+	for _, author := range work.Authors {
+		if !c.enqueueDenorm(ctx, edge{kind: authorEdge, parentID: author.ForeignID, childIDs: newSet(workID)}) {
+			return ctx.Err()
 		}
-	}()
+	}
 
 	return nil
 }
@@ -1046,10 +1455,7 @@ func (c *Controller) denormalizeWorks(ctx context.Context, authorID int64, workI
 		return nil
 	}
 
-	authorBytes, _, err := c.GetAuthor(ctx, authorID)
-	if errors.Is(err, statusErr(http.StatusTooManyRequests)) {
-		authorBytes, _, err = c.GetAuthor(ctx, authorID) // Reload if we got a cold cache.
-	}
+	authorBytes, _, err := c.getAuthorForDenormalization(ctx, authorID)
 	if err != nil {
 		Log(ctx).Debug("problem loading author for denormalizeWorks", "err", err)
 		return err

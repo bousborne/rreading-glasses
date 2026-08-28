@@ -95,6 +95,35 @@ The `latest` tag uses G——R—— for metadata and the `hardcover` tag uses
 [Hardcover](https://hardcover.app). See the table below for a summary of the
 differences between the two.
 
+The upstream images do **not** contain unmerged changes from a fork. When
+running this checkout, publish its `cmd/rghc` image to your own registry and
+set `RREADING_GLASSES_IMAGE` in `.env` to an immutable tag (or digest). The
+included Hardcover Compose file deliberately requires that value so it cannot
+silently start an upstream image without the safeguards documented below. For
+example:
+
+```dotenv
+RREADING_GLASSES_IMAGE=ghcr.io/bousborne/rreading-glasses:hardcover-sha-0123456
+```
+
+This fork includes a guarded multi-platform release target. It refuses to
+publish a dirty worktree, tags the image with the current commit, pushes both
+`linux/amd64` and `linux/arm64`, and verifies the resulting manifest. After
+running the normal lint and database-backed test suite, publish with:
+
+```bash
+cd /path/to/rreading-glasses
+printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username bousborne --password-stdin
+make release-hc
+```
+
+The resulting image is
+`ghcr.io/bousborne/rreading-glasses:hardcover-sha-$(git rev-parse --short=7 HEAD)`.
+If you use a named Buildx builder, append for example
+`PUBLISH_BUILDER=rrg-multiarch`. Override `PUBLISH_REPOSITORY` when publishing
+under another account. Put the exact emitted tag into `.env`; do not replace it
+with a moving `latest` tag.
+
 A Postgres backend (any version) is required.
 
 Two docker compose example files are included as a reference:
@@ -116,6 +145,56 @@ When using Hardcover you must set the `hardcover-auth` parameter.
 Note that your API key **will expire every year on January 1**, so you'll need
 to periodically regenerate it.
 
+### Hardcover quota safety
+
+Hardcover enforces a request quota. The self-hosted Hardcover service therefore
+paces physical GraphQL requests, bounds queued work, and opens a process-wide
+circuit breaker after the first HTTP 429 response. While that circuit is open,
+requests fail locally with HTTP 429 and the remaining `Retry-After` value; no
+additional Hardcover calls are made. The absolute deadline is stored in the
+same persistent cache and restored before startup recovery, so restarting the
+container cannot bypass it. Both delta-seconds and HTTP-date headers are
+supported, with a conservative fallback when the provider omits one.
+
+Interactive lookups receive bounded priority over background refreshes, but
+background work cannot be starved. Search hydration is limited and ordered,
+and a rate limit aborts the search instead of returning a partial result that a
+client could cache. Indirectly discovering an author loads only their basic
+record; a complete catalogue crawl is started only by an explicit author
+request. Full-author crawls are deduplicated, serialized, exponentially backed
+off, and paused after repeated incomplete attempts.
+
+Copy [`.env.example`](./.env.example) to `.env`, replace the image placeholder
+with the immutable tag published from this commit, and then use the Hardcover
+Compose example. The remaining defaults are appropriate for a personal
+Bookshelf instance:
+
+| Variable | Default | Effect |
+| --- | ---: | --- |
+| `BATCH_INTERVAL` | `2s` | Minimum spacing between physical GraphQL calls. |
+| `BATCH_SIZE` | `1` | Background fields per GraphQL request; Hardcover allows at most 5. |
+| `SEARCH_BATCH_SIZE` | `1` | Interactive fields per request. |
+| `MAX_PENDING_QUERIES` | `100` | Local queue capacity before fast HTTP 503 admission rejection. |
+| `REQUEST_TIMEOUT` | `30s` | Deadline for one physical request. |
+| `RATE_LIMIT_COOLDOWN` | `15m` | Fallback cooldown for a 429 without valid `Retry-After`. |
+| `SEARCH_RESULTS` | `5` | Maximum search works hydrated per lookup. |
+| `AUTHOR_REFRESH_CONCURRENCY` | `1` | Simultaneous full-author catalogue crawls. |
+| `AUTHOR_REFRESH_RETRY_BASE` | `1h` | Initial incomplete-refresh retry delay. |
+| `AUTHOR_REFRESH_RETRY_MAX` | `24h` | Maximum exponential retry delay. |
+| `AUTHOR_REFRESH_MAX_ATTEMPTS` | `6` | Attempts before pausing until an explicit request or restart. |
+| `AUTHOR_RECOVERY_INTERVAL` | `5m` | Startup spacing between persisted refresh jobs. |
+
+The Compose-only `RREADING_GLASSES_STOP_GRACE_PERIOD` defaults to `40s`,
+allowing the application's 30-second ordered shutdown drain to finish before
+Docker sends `SIGKILL`.
+
+Do not increase concurrency to compensate for a 429. If Hardcover supplies a
+longer deadline than `RATE_LIMIT_COOLDOWN`, that provider deadline wins.
+
+Live Hardcover tests are excluded from routine `go test ./...` runs even when
+an API key is present. Run them deliberately with
+`RUN_HARDCOVER_INTEGRATION=1 HARDCOVER_API_KEY=... go test ./internal -run 'Test(Batching|HardcoverIntegration)'`.
+
 ### Resource Requirements
 
 Resource requirements are minimal; a Raspberry Pi should suffice. Storage
@@ -126,8 +205,12 @@ queried over time.)
 
 ### Troubleshooting
 
-When in doubt, make sure you have the latest image pulled: `docker pull
-blampe/rreading-glasses:latest` or `blampe/rreading-glasses:hardcover`.
+When in doubt, verify and pull the exact image configured for this checkout:
+
+```bash
+docker compose --env-file .env -f docker-compose-hardcover.yml config --images
+docker compose --env-file .env -f docker-compose-hardcover.yml pull rreading-glasses
+```
 
 If you suspect data inconsistencies, request an [author
 refresh](https://github.com/blampe/rreading-glasses/issues/new?template=refresh.yml)

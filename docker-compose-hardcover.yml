@@ -4,22 +4,41 @@ services:
   rreading-glasses:
     depends_on:
       rreading-glasses-db:
-        condition: service_started  
-    image: blampe/rreading-glasses:hardcover
-    pull_policy: always
+        condition: service_healthy
+    # Pin this to an immutable image published from this fork. The upstream
+    # blampe image does not contain the quota-safety controls in this checkout.
+    image: ${RREADING_GLASSES_IMAGE:?Set RREADING_GLASSES_IMAGE in .env to a pinned fork image}
+    pull_policy: ${RREADING_GLASSES_PULL_POLICY:-always}
     container_name: rreading-glasses
     hostname: rreading-glasses
     entrypoint: ["/main", "serve"]
     command:
       - --verbose
     restart: unless-stopped
+    # The application uses a 30-second ordered drain for active refresh and
+    # denormalization work. Give it time to finish before Docker sends SIGKILL.
+    stop_grace_period: ${RREADING_GLASSES_STOP_GRACE_PERIOD:-40s}
     mem_limit: 128m
     environment:
-      HARDCOVER_AUTH: # Only used for Hardcover. Starts with Bearer
+      # Safe self-hosting defaults. These values intentionally favor provider
+      # quota safety over bulk catalog-refresh speed.
+      HARDCOVER_AUTH: ${HARDCOVER_AUTH:?Set HARDCOVER_AUTH in .env, including Bearer}
+      BATCH_INTERVAL: ${BATCH_INTERVAL:-2s}
+      BATCH_SIZE: ${BATCH_SIZE:-1}
+      SEARCH_BATCH_SIZE: ${SEARCH_BATCH_SIZE:-1}
+      MAX_PENDING_QUERIES: ${MAX_PENDING_QUERIES:-100}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-30s}
+      RATE_LIMIT_COOLDOWN: ${RATE_LIMIT_COOLDOWN:-15m}
+      SEARCH_RESULTS: ${SEARCH_RESULTS:-5}
+      AUTHOR_REFRESH_CONCURRENCY: ${AUTHOR_REFRESH_CONCURRENCY:-1}
+      AUTHOR_REFRESH_RETRY_BASE: ${AUTHOR_REFRESH_RETRY_BASE:-1h}
+      AUTHOR_REFRESH_RETRY_MAX: ${AUTHOR_REFRESH_RETRY_MAX:-24h}
+      AUTHOR_REFRESH_MAX_ATTEMPTS: ${AUTHOR_REFRESH_MAX_ATTEMPTS:-6}
+      AUTHOR_RECOVERY_INTERVAL: ${AUTHOR_RECOVERY_INTERVAL:-5m}
       POSTGRES_HOST: rreading-glasses-db
       POSTGRES_DATABASE: rreading-glasses
       POSTGRES_USER: rreading-glasses
-      POSTGRES_PASSWORD:  # Generate a random string without special symbols
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports:
       - "8788:8788"
 
@@ -30,8 +49,13 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: rreading-glasses
-      POSTGRES_PASSWORD:  # Generated password from above
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: rreading-glasses
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rreading-glasses -d rreading-glasses"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
     ports:
       - "5432:5432"
     volumes:

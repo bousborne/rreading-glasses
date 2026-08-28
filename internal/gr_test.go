@@ -613,6 +613,7 @@ func TestGRIntegration(t *testing.T) {
 	require.NoError(t, err)
 	ctrl, err := NewController(cache, getter, nil, nil)
 	go ctrl.Run(t.Context())
+	t.Cleanup(func() { ctrl.Shutdown(context.Background()) })
 
 	require.NoError(t, err)
 

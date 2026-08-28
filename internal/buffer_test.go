@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -89,4 +90,18 @@ func TestAccumulateSlice(t *testing.T) {
 
 	_, ok := <-consumer
 	assert.False(t, ok)
+}
+
+func TestAccumulateWithContextStopsConsumer(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	producer := make(chan int)
+	consumer := accumulateWithContext(ctx, producer, &slicebuffer[int]{})
+	cancel()
+
+	select {
+	case _, ok := <-consumer:
+		assert.False(t, ok)
+	case <-time.After(time.Second):
+		t.Fatal("consumer did not stop after context cancellation")
+	}
 }

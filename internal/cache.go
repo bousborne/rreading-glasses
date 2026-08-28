@@ -110,6 +110,42 @@ func (c *LayeredCache) Set(ctx context.Context, key string, val []byte, ttl time
 	}
 }
 
+// PersistRateLimitState writes the circuit-breaker deadline to Postgres and
+// reports failure to the caller. The generic cache Set API deliberately logs
+// and continues, but a restart-safety record needs explicit durability.
+func (c *LayeredCache) PersistRateLimitState(ctx context.Context, key string, val []byte, ttl time.Duration) error {
+	var durable *pgcache
+	for _, cc := range c.wrapped {
+		if pg, ok := cc.(*pgcache); ok {
+			durable = pg
+			break
+		}
+	}
+	if durable == nil {
+		return fmt.Errorf("persistent rate-limit state requires a Postgres cache layer")
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := durable.set(persistCtx, key, val, ttl); err != nil {
+		return fmt.Errorf("persisting rate-limit state: %w", err)
+	}
+
+	// Populate only local non-durable layers after Postgres commits. Remote
+	// invalidation layers do not need to see this internal state key.
+	for _, cc := range c.wrapped {
+		if memory, ok := cc.(*memoryCache); ok {
+			memory.Set(ctx, key, val, ttl)
+		}
+	}
+	return nil
+}
+
+func (c *LayeredCache) DeleteRateLimitState(ctx context.Context, key string) error {
+	deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	return c.Delete(deleteCtx, key)
+}
+
 // NewCache constructs a new layered cache.
 func NewCache(ctx context.Context, dsn string, cf *CloudflareCache, reg *prometheus.Registry) (*LayeredCache, error) {
 	m := newMemoryCache()
@@ -126,20 +162,21 @@ func NewCache(ctx context.Context, dsn string, cf *CloudflareCache, reg *prometh
 		c.wrapped = append(c.wrapped, cf)
 	}
 
-	if cf != nil {
-		c.wrapped = append(c.wrapped, cf)
-	}
-
 	// Log cache stats every minute.
 	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
 		for {
-			time.Sleep(1 * time.Minute)
-
-			Log(ctx).LogAttrs(ctx, slog.LevelDebug, "cache stats",
-				slog.Int64("hits", c.metrics.cacheHitGet()),
-				slog.Int64("misses", c.metrics.cacheMissGet()),
-				slog.Float64("ratio", c.metrics.cacheHitRatioGet()),
-			)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				Log(ctx).LogAttrs(ctx, slog.LevelDebug, "cache stats",
+					slog.Int64("hits", c.metrics.cacheHitGet()),
+					slog.Int64("misses", c.metrics.cacheMissGet()),
+					slog.Float64("ratio", c.metrics.cacheHitRatioGet()),
+				)
+			}
 		}
 	}()
 

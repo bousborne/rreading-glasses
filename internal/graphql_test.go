@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -296,6 +297,9 @@ fragment BookInfo on Book {
 }
 
 func TestBatching(t *testing.T) {
+	if os.Getenv("RUN_HARDCOVER_INTEGRATION") != "1" {
+		t.Skip("set RUN_HARDCOVER_INTEGRATION=1 to run live Hardcover tests")
+	}
 	apiKey := os.Getenv("HARDCOVER_API_KEY")
 	if apiKey == "" {
 		t.Skip("missing HARDCOVER_API_KEY")
@@ -311,7 +315,7 @@ func TestBatching(t *testing.T) {
 
 	url := "https://api.hardcover.app/v1/graphql"
 
-	gql, err := NewBatchedGraphQLClient(url, client, time.Second, 6, nil)
+	gql, err := NewBatchedGraphQLClient(url, client, 2*time.Second, 1, nil)
 	require.NoError(t, err)
 
 	start := time.Now()
@@ -432,7 +436,7 @@ func TestBatchingRespectsBatchSize(t *testing.T) {
 
 	wg := sync.WaitGroup{}
 	errs := make([]error, numQueries)
-	for i := 0; i < numQueries; i++ {
+	for i := range numQueries {
 		wg.Add(1)
 
 		go func() {
@@ -482,14 +486,14 @@ func TestBatchingAllowsOnlyOneUpstreamRequestInFlight(t *testing.T) {
 	defer close(release)
 	wg := sync.WaitGroup{}
 	wg.Add(numQueries)
-	for i := 0; i < numQueries; i++ {
+	for i := range numQueries {
 		go func(id int64) {
 			defer wg.Done()
 			_, _ = gr.GetBook(t.Context(), gql, id)
 		}(int64(i + 1))
 	}
 
-	for i := 0; i < numQueries; i++ {
+	for i := range numQueries {
 		select {
 		case <-started:
 		case <-time.After(time.Second):
@@ -508,33 +512,144 @@ func TestBatchingAllowsOnlyOneUpstreamRequestInFlight(t *testing.T) {
 	wg.Wait()
 }
 
-func TestBatchingRetriesRateLimitedRequest(t *testing.T) {
-	var calls atomic.Int32
-	client := &http.Client{
-		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
-			if calls.Add(1) == 1 {
-				return &http.Response{
-					StatusCode: http.StatusTooManyRequests,
-					Body:       io.NopCloser(strings.NewReader(`{"data": null}`)),
-				}, nil
-			}
+func TestBatchingSpacesEveryPhysicalRetry(t *testing.T) {
+	var mu sync.Mutex
+	attempts := make([]time.Time, 0, 3)
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		mu.Lock()
+		attempts = append(attempts, time.Now())
+		attempt := len(attempts)
+		mu.Unlock()
+		if attempt < 3 {
+			return nil, &net.DNSError{Err: "temporary test failure", IsTemporary: true}
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"data": {}}`)),
+		}, nil
+	})}
 
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"data": {}}`)),
-			}, nil
-		}),
-	}
-
-	gql, err := NewBatchedGraphQLClient("https://foo.com", client, time.Millisecond, 1, nil)
+	config := DefaultHardcoverBatcherConfig()
+	config.BatchInterval = 40 * time.Millisecond
+	config.NetworkRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	config.RequestTimeout = time.Second
+	gql, err := NewConfiguredBatchedGraphQLClient(t.Context(), "https://foo.com", client, config, nil, nil)
 	require.NoError(t, err)
-	batched := gql.(*batchedgqlclient)
-	batched.retryBase = time.Millisecond
-	batched.maxRetries = 1
+	t.Cleanup(func() { _ = gql.Close() })
 
 	_, err = gr.GetBook(t.Context(), gql, 1)
-	assert.NoError(t, err)
-	assert.Equal(t, int32(2), calls.Load())
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, attempts, 3)
+	for i := 1; i < len(attempts); i++ {
+		assert.GreaterOrEqual(t, attempts[i].Sub(attempts[i-1]), 35*time.Millisecond,
+			"physical attempt %d started before BATCH_INTERVAL elapsed", i+1)
+	}
+}
+
+func TestBatchingRateLimitOpensCircuitWithoutRetry(t *testing.T) {
+	var calls atomic.Int32
+	gate := NewRateLimitGate(time.Hour)
+	client := &http.Client{Transport: RateLimitTransport{
+		Gate: gate,
+		RoundTripper: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Status:     "429 Too Many Requests",
+				Header:     http.Header{"Retry-After": []string{"3600"}},
+				Body:       io.NopCloser(strings.NewReader(`{"data": null}`)),
+			}, nil
+		}),
+	}}
+
+	config := DefaultHardcoverBatcherConfig()
+	config.BatchInterval = time.Millisecond
+	config.NetworkRetryDelays = nil
+	gql, err := NewConfiguredBatchedGraphQLClient(t.Context(), "https://foo.com", client, config, gate, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = gql.Close() })
+
+	_, err = gr.GetBook(t.Context(), gql, 1)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, statusErr(http.StatusTooManyRequests))
+	assert.Equal(t, int32(1), calls.Load())
+
+	_, err = gr.GetBook(t.Context(), gql, 2)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, statusErr(http.StatusTooManyRequests))
+	assert.Equal(t, int32(1), calls.Load(), "open circuit must reject locally")
+}
+
+func TestBatchingCanceledBeforeFlushMakesNoUpstreamRequest(t *testing.T) {
+	var calls atomic.Int32
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"data": {}}`))}, nil
+	})}
+	config := DefaultHardcoverBatcherConfig()
+	config.BatchInterval = 10 * time.Millisecond
+	gql, err := NewConfiguredBatchedGraphQLClient(t.Context(), "https://foo.com", client, config, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = gql.Close() })
+	batched := gql.(*batchedgqlclient)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = gr.GetBook(ctx, gql, 1)
+	assert.ErrorIs(t, err, context.Canceled)
+	batched.flush(t.Context())
+	assert.Equal(t, int32(0), calls.Load())
+}
+
+func TestBatchingRejectsQueueOverflowImmediately(t *testing.T) {
+	client := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"data": {}}`))}, nil
+	})}
+	config := DefaultHardcoverBatcherConfig()
+	config.BatchInterval = time.Hour
+	config.MaxPendingQueries = 1
+	gql, err := NewConfiguredBatchedGraphQLClient(t.Context(), "https://foo.com", client, config, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = gql.Close() })
+	batched := gql.(*batchedgqlclient)
+
+	firstCtx, cancelFirst := context.WithCancel(t.Context())
+	firstDone := make(chan error, 1)
+	go func() {
+		_, requestErr := gr.GetBook(firstCtx, gql, 1)
+		firstDone <- requestErr
+	}()
+	require.Eventually(t, func() bool {
+		batched.mu.Lock()
+		defer batched.mu.Unlock()
+		return batched.pendingQueries == 1
+	}, time.Second, time.Millisecond)
+
+	started := time.Now()
+	_, err = gr.GetBook(t.Context(), gql, 2)
+	assert.ErrorIs(t, err, statusErr(http.StatusServiceUnavailable))
+	assert.Less(t, time.Since(started), 100*time.Millisecond)
+	cancelFirst()
+	assert.ErrorIs(t, <-firstDone, context.Canceled)
+}
+
+func TestHardcoverBatcherConfigRejectsOversizedBatches(t *testing.T) {
+	config := DefaultHardcoverBatcherConfig()
+	config.BatchSize = 6
+	_, err := NewConfiguredBatchedGraphQLClient(t.Context(), "https://foo.com", http.DefaultClient, config, nil, nil)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "5-field limit")
+}
+
+func TestHardcoverBatcherConfigCapsPhysicalAttempts(t *testing.T) {
+	config := DefaultHardcoverBatcherConfig()
+	config.NetworkRetryDelays = []time.Duration{time.Second, time.Second, time.Second}
+	_, err := NewConfiguredBatchedGraphQLClient(t.Context(), "https://foo.com", http.DefaultClient, config, nil, nil)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "at most three physical attempts")
 }
 
 func TestGQLStatusCode(t *testing.T) {

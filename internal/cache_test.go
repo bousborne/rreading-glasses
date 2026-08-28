@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCache(t *testing.T) {
@@ -57,4 +58,16 @@ func TestCache(t *testing.T) {
 		assert.True(t, ok)
 		assert.Equal(t, val, out)
 	})
+}
+
+func TestLayeredCacheRateLimitStateRequiresDurableLayer(t *testing.T) {
+	ctx := t.Context()
+	l := &LayeredCache{
+		wrapped: []cache[[]byte]{newMemoryCache()},
+		metrics: newCacheMetrics(NewMetrics()),
+	}
+
+	err := l.PersistRateLimitState(ctx, hardcoverRateLimitStateKey, []byte(time.Now().Add(time.Hour).Format(time.RFC3339Nano)), time.Hour)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "Postgres")
 }

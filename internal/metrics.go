@@ -232,17 +232,7 @@ func newDBMetrics(db *pgxpool.Pool, reg *prometheus.Registry) *dbMetrics {
 	go func() {
 		ctx := context.Background()
 		for {
-			row := db.QueryRow(ctx, `
-			  SELECT
-				sum(CASE WHEN key LIKE 'a%'  THEN 1 ELSE 0 END) AS authors,
-				sum(CASE WHEN key LIKE 'b%'  THEN 1 ELSE 0 END) AS editions,
-				sum(CASE WHEN key LIKE 'w%'  THEN 1 ELSE 0 END) AS works,
-				sum(CASE WHEN key LIKE 'ra%' THEN 1 ELSE 0 END) AS refreshing,
-				sum(CASE WHEN key LIKE 's%'  THEN 1 ELSE 0 END) AS seriess,
-				sum(CASE WHEN key LIKE 'z%'  THEN 1 ELSE 0 END) AS asin,
-				sum(CASE WHEN key LIKE 'i%'  THEN 1 ELSE 0 END) AS isbn
-			  FROM cache;
-			`)
+			row := db.QueryRow(ctx, cacheStatsQuery)
 			var authors, editions, works, refreshing, series, asin, isbn int64
 			err := row.Scan(&authors, &editions, &works, &refreshing, &series, &asin, &isbn)
 			if err != nil {
@@ -262,6 +252,20 @@ func newDBMetrics(db *pgxpool.Pool, reg *prometheus.Registry) *dbMetrics {
 	}()
 	return &dbMetrics{gauge: gauge}
 }
+
+// Author keys are "a" followed by a decimal ID. The narrower range excludes
+// durable "arn..." author-refresh-needed markers from the author gauge.
+const cacheStatsQuery = `
+  SELECT
+	sum(CASE WHEN key >= 'a0' AND key < 'a:' THEN 1 ELSE 0 END) AS authors,
+	sum(CASE WHEN key LIKE 'b%'  THEN 1 ELSE 0 END) AS editions,
+	sum(CASE WHEN key LIKE 'w%'  THEN 1 ELSE 0 END) AS works,
+	sum(CASE WHEN key >= 'ra0' AND key < 'ra:' THEN 1 ELSE 0 END) AS refreshing,
+	sum(CASE WHEN key LIKE 's%'  THEN 1 ELSE 0 END) AS seriess,
+	sum(CASE WHEN key LIKE 'z%'  THEN 1 ELSE 0 END) AS asin,
+	sum(CASE WHEN key LIKE 'i%'  THEN 1 ELSE 0 END) AS isbn
+  FROM cache;
+`
 
 func (dbm *dbMetrics) authorsSet(n int64) {
 	dbm.gauge.WithLabelValues("authors").Set(float64(n))
@@ -425,13 +429,41 @@ func (gm *gqlMetrics) batchesWaitingSet(n int) {
 	gm.gauge.WithLabelValues("batches").Set(float64(n))
 }
 
+func (gm *gqlMetrics) queriesWaitingSet(n int) {
+	gm.gauge.WithLabelValues("queries").Set(float64(n))
+}
+
+func (gm *gqlMetrics) cooldownSecondsSet(delay time.Duration) {
+	gm.gauge.WithLabelValues("cooldown_seconds").Set(max(0, delay.Seconds()))
+}
+
 func (gm *gqlMetrics) batchesWaitingGet() int {
 	m := &dto.Metric{}
-	err := gm.totals.WithLabelValues("batches").Write(m)
+	err := gm.gauge.WithLabelValues("batches").Write(m)
 	if err != nil {
 		return 0
 	}
-	return int(m.GetCounter().GetValue())
+	return int(m.GetGauge().GetValue())
+}
+
+func (gm *gqlMetrics) physicalAttemptsInc() {
+	gm.totals.WithLabelValues("physical_attempts").Inc()
+}
+
+func (gm *gqlMetrics) upstreamRateLimitsInc() {
+	gm.totals.WithLabelValues("upstream_rate_limits").Inc()
+}
+
+func (gm *gqlMetrics) localCooldownRejectsInc() {
+	gm.totals.WithLabelValues("local_cooldown_rejects").Inc()
+}
+
+func (gm *gqlMetrics) queueFullRejectsInc() {
+	gm.totals.WithLabelValues("queue_full_rejects").Inc()
+}
+
+func (gm *gqlMetrics) canceledInc() {
+	gm.totals.WithLabelValues("canceled_queries").Inc()
 }
 
 func (cm *cloudflareMetrics) urlsBustedAdd(delta int) {
@@ -451,7 +483,7 @@ func (cm cloudflareMetrics) batchesWaitingGet() int {
 	if err != nil {
 		return 0
 	}
-	return int(m.GetCounter().GetValue())
+	return int(m.GetGauge().GetValue())
 }
 
 // normalizePattern derives the constant label from the pattern:

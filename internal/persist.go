@@ -1,9 +1,9 @@
 package internal
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"maps"
 	"slices"
 	"strconv"
 	"time"
@@ -68,14 +68,20 @@ func (p *Persister) Delete(ctx context.Context, authorID int64) error {
 func (p *Persister) Persisted(ctx context.Context) ([]int64, error) {
 	start := time.Now()
 
-	rows, err := p.db.Query(ctx, "SELECT SUBSTRING(key, 3), expires FROM cache WHERE key LIKE 'ra%'")
+	// A range predicate can use the cache primary-key index. LIKE 'ra%' caused
+	// a sequential scan on large metadata caches during startup recovery.
+	rows, err := p.db.Query(ctx, "SELECT SUBSTRING(key, 3), expires FROM cache WHERE key >= 'ra' AND key < 'rb'")
 	if err != nil {
 		Log(ctx).Error("unable to recover in-flight refreshes", "err", err)
 		return nil, err
 	}
 	defer rows.Close()
 
-	m := map[int64]int64{}
+	type persistedAuthor struct {
+		id      int64
+		expires time.Time
+	}
+	items := make([]persistedAuthor, 0)
 
 	for rows.Next() {
 		var id string
@@ -85,20 +91,37 @@ func (p *Persister) Persisted(ctx context.Context) ([]int64, error) {
 			continue
 		}
 		if authorID, err := strconv.ParseInt(id, 10, 64); err == nil {
-			m[expires.Time.UnixNano()] = authorID
+			items = append(items, persistedAuthor{id: authorID, expires: expires.Time})
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading persisted author refreshes: %w", err)
+	}
 
-	authorIDs := make([]int64, 0, len(m))
-	for _, key := range slices.Sorted(maps.Keys(m)) {
-		authorIDs = append(authorIDs, m[key])
+	// Do not key by expiration timestamp: distinct rows can share a timestamp,
+	// and the old map silently dropped all but one of them. Sort the records
+	// directly and use the author ID as a deterministic tie-breaker.
+	slices.SortFunc(items, func(a, b persistedAuthor) int {
+		if ordered := a.expires.Compare(b.expires); ordered != 0 {
+			return ordered
+		}
+		return cmp.Compare(a.id, b.id)
+	})
+	authorIDs := make([]int64, 0, len(items))
+	seen := make(map[int64]struct{}, len(items))
+	for _, item := range items {
+		if _, ok := seen[item.id]; ok {
+			continue
+		}
+		seen[item.id] = struct{}{}
+		authorIDs = append(authorIDs, item.id)
 	}
 
 	if len(authorIDs) > 0 {
 		Log(ctx).Debug("recovered in-flight refreshes", "count", len(authorIDs), "duration", time.Since(start).String())
 	}
 
-	return authorIDs, err
+	return authorIDs, nil
 }
 
 func refreshAuthorKey(authorID int64) string {

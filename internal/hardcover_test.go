@@ -52,6 +52,65 @@ func TestBestHardcoverEditionUsesAudioDefault(t *testing.T) {
 	assert.Equal(t, audioID, bestHardcoverEdition(defaults, authorID))
 }
 
+func TestHardcoverSearchLimitsHydrationAndPreservesOrder(t *testing.T) {
+	cache := newMemoryCache()
+	ctx := t.Context()
+	ids := []int64{10, 20, 30, 40, 50, 60}
+	for _, id := range ids {
+		bytes, err := json.Marshal(workResource{
+			ForeignID:  id,
+			BestBookID: id + 1000,
+			Authors:    []AuthorResource{{ForeignID: id + 2000}},
+		})
+		require.NoError(t, err)
+		cache.Set(ctx, WorkKey(id), bytes, time.Hour)
+	}
+
+	gql := hardcover.NewMockgql(gomock.NewController(t))
+	gql.EXPECT().MakeRequest(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, req *graphql.Request, resp *graphql.Response) error {
+			require.Equal(t, "Search", req.OpName)
+			data := resp.Data.(*hardcover.SearchResponse)
+			data.Search.Ids = ids
+			return nil
+		},
+	)
+	getter, err := NewConfiguredHardcoverGetter(cache, gql, 5)
+	require.NoError(t, err)
+
+	results, err := getter.Search(ctx, "ordered results")
+	require.NoError(t, err)
+	require.Len(t, results, 5)
+	for index, result := range results {
+		assert.Equal(t, ids[index], result.WorkID)
+	}
+}
+
+func TestHardcoverSearchPropagatesHydrationRateLimit(t *testing.T) {
+	gql := hardcover.NewMockgql(gomock.NewController(t))
+	gql.EXPECT().MakeRequest(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, req *graphql.Request, resp *graphql.Response) error {
+			switch req.OpName {
+			case "Search":
+				data := resp.Data.(*hardcover.SearchResponse)
+				data.Search.Ids = []int64{10, 20}
+				return nil
+			case "GetWork":
+				return &RateLimitError{Until: time.Now().Add(time.Hour)}
+			default:
+				return fmt.Errorf("unexpected operation %s", req.OpName)
+			}
+		},
+	).Times(2)
+	getter, err := NewConfiguredHardcoverGetter(newMemoryCache(), gql, 5)
+	require.NoError(t, err)
+
+	results, err := getter.Search(t.Context(), "limited")
+	require.Error(t, err)
+	assert.Nil(t, results)
+	assert.ErrorIs(t, err, statusErr(http.StatusTooManyRequests))
+}
+
 func TestGetBookDataIntegrity(t *testing.T) {
 	// The client is particularly sensitive to null values.
 	// For a given work resource, it MUST
@@ -356,7 +415,9 @@ func TestGetBookDataIntegrity(t *testing.T) {
 }
 
 func TestHardcoverIntegration(t *testing.T) {
-	t.Parallel()
+	if os.Getenv("RUN_HARDCOVER_INTEGRATION") != "1" {
+		t.Skip("set RUN_HARDCOVER_INTEGRATION=1 to run live Hardcover tests")
+	}
 
 	key := os.Getenv("HARDCOVER_API_KEY")
 	if key == "" {
@@ -377,7 +438,7 @@ func TestHardcoverIntegration(t *testing.T) {
 
 	hcClient := &http.Client{Transport: hcTransport}
 
-	gql, err := NewBatchedGraphQLClient("https://api.hardcover.app/v1/graphql", hcClient, time.Second, 25, nil)
+	gql, err := NewBatchedGraphQLClient("https://api.hardcover.app/v1/graphql", hcClient, 2*time.Second, 1, nil)
 	require.NoError(t, err)
 
 	getter, err := NewHardcoverGetter(cache, gql)
@@ -386,6 +447,7 @@ func TestHardcoverIntegration(t *testing.T) {
 	ctrl, err := NewController(cache, getter, nil, nil)
 	require.NoError(t, err)
 	go ctrl.Run(t.Context())
+	t.Cleanup(func() { ctrl.Shutdown(context.Background()) })
 
 	t.Run("GetAuthor", func(t *testing.T) {
 		t.Parallel()

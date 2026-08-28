@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,14 @@ type bbuffer[T any] interface {
 // have tens of thousands of idle goroutines, at which point the scheduler can
 // eat up CPU trying to find something to run.
 func accumulate[T any](producer <-chan T, buf bbuffer[T]) <-chan T {
+	return accumulateWithContext(context.Background(), producer, buf)
+}
+
+// accumulateWithContext behaves like accumulate and also closes the consumer
+// when the service context is canceled. This lets Controller.Run terminate
+// cleanly without closing producer channels that active workers may still
+// reference.
+func accumulateWithContext[T any](ctx context.Context, producer <-chan T, buf bbuffer[T]) <-chan T {
 	c := make(chan T)
 
 	go func() {
@@ -36,6 +45,9 @@ func accumulate[T any](producer <-chan T, buf bbuffer[T]) <-chan T {
 			// Either buffer the next produced element, or pass a buffered
 			// entry down to the consumer.
 			select {
+			case <-ctx.Done():
+				close(c)
+				return
 			case val, ok := <-producer:
 				if !ok {
 					close(c)
@@ -126,6 +138,8 @@ func (b *edgebuf) push(e edge) {
 		}
 	case refreshDone:
 		// Nothing else to do.
+	case drainEdge:
+		// Drain barriers must retain FIFO order but are never merged.
 	default:
 		panic(fmt.Sprintf("unrecognized edge kind %q", fmt.Sprint(rune(e.kind))))
 	}
@@ -175,6 +189,8 @@ func (b *edgebuf) pop() edge {
 	case workEdge:
 		delete(b.works, edge.parentID)
 	case refreshDone:
+		// Nothing else to do.
+	case drainEdge:
 		// Nothing else to do.
 	default:
 		panic("unrecognized edge kind")

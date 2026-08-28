@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"iter"
 	"maps"
+	"net/http"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Khan/genqlient/graphql"
@@ -21,20 +21,32 @@ import (
 // attempts to minimize upstream HEAD requests (to resolve book/work IDs) by
 // relying on HC's raw external data.
 type HCGetter struct {
-	cache cache[[]byte]
-	gql   graphql.Client
+	cache             cache[[]byte]
+	gql               graphql.Client
+	searchResultLimit int
 }
 
 var _ getter = (*HCGetter)(nil)
 
 // NewHardcoverGetter returns a new Getter backed by Hardcover.
 func NewHardcoverGetter(cache cache[[]byte], gql graphql.Client) (*HCGetter, error) {
-	return &HCGetter{cache: cache, gql: gql}, nil
+	return NewConfiguredHardcoverGetter(cache, gql, 5)
+}
+
+// NewConfiguredHardcoverGetter creates a Hardcover getter with a bounded
+// search hydration fan-out. A normal search result can contain 15 works and
+// hydrating every one is disproportionately expensive under provider quotas.
+func NewConfiguredHardcoverGetter(cache cache[[]byte], gql graphql.Client, searchResultLimit int) (*HCGetter, error) {
+	if searchResultLimit <= 0 || searchResultLimit > 15 {
+		return nil, fmt.Errorf("search result limit must be between 1 and 15")
+	}
+	return &HCGetter{cache: cache, gql: gql, searchResultLimit: searchResultLimit}, nil
 }
 
 // Search hits the GraphQL endpoint to fetch relevant work IDs and then fetches
 // those in order to return the necessary edition and author IDs to the client.
 func (g *HCGetter) Search(ctx context.Context, query string) ([]SearchResource, error) {
+	ctx = WithInteractivePriority(ctx)
 	workIDs := []int64{}
 
 	// Try a lookup by ASIN/ISBN if the query looks like one
@@ -55,46 +67,49 @@ func (g *HCGetter) Search(ctx context.Context, query string) ([]SearchResource, 
 		workIDs = resp.Search.Ids
 	}
 
-	wg := sync.WaitGroup{}
-	mu := sync.Mutex{}
-
-	results := []SearchResource{}
-
-	for _, workID := range workIDs {
-		wg.Go(func() {
-			id := workID
-
-			bytes, _, err := g.GetWork(ctx, id, nil)
-			if err != nil {
-				return
-			}
-
-			var workRsc workResource
-			err = json.Unmarshal(bytes, &workRsc)
-			if err != nil {
-				return
-			}
-
-			if len(workRsc.Authors) == 0 {
-				Log(ctx).Warn("work is missing an author", "workID", id, "err", err)
-				return
-			}
-
-			mu.Lock()
-			defer mu.Unlock()
-
-			results = append(results, SearchResource{
-				BookID: workRsc.BestBookID,
-				WorkID: workRsc.ForeignID,
-				Author: SearchResourceAuthor{
-					ID: workRsc.Authors[0].ForeignID,
-				},
-			})
-		})
+	workIDs = slices.Compact(workIDs)
+	if len(workIDs) > g.searchResultLimit {
+		workIDs = workIDs[:g.searchResultLimit]
 	}
 
-	wg.Wait()
+	// Hydrate in provider relevance order and stop immediately on a quota
+	// signal. Returning a partial HTTP 200 after a 429 would cause Bookshelf to
+	// cache incomplete search results for a day.
+	results := make([]SearchResource, 0, len(workIDs))
+	var firstErr error
+	for _, workID := range workIDs {
+		bytes, _, err := g.GetWork(ctx, workID, nil)
+		if err != nil {
+			if errors.Is(err, statusErr(http.StatusTooManyRequests)) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			Log(ctx).Warn("unable to hydrate search result", "workID", workID, "err", err)
+			continue
+		}
 
+		var workRsc workResource
+		if err := json.Unmarshal(bytes, &workRsc); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if len(workRsc.Authors) == 0 {
+			Log(ctx).Warn("work is missing an author", "workID", workID)
+			continue
+		}
+		results = append(results, SearchResource{
+			BookID: workRsc.BestBookID,
+			WorkID: workRsc.ForeignID,
+			Author: SearchResourceAuthor{ID: workRsc.Authors[0].ForeignID},
+		})
+	}
+	if len(results) == 0 && firstErr != nil {
+		return nil, fmt.Errorf("hydrating search results: %w", firstErr)
+	}
 	return results, nil
 }
 

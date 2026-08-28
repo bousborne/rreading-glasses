@@ -121,11 +121,14 @@ func (pg *pgcache) GetWithTTL(ctx context.Context, key string) ([]byte, time.Dur
 }
 
 func (pg *pgcache) Set(ctx context.Context, key string, val []byte, ttl time.Duration) {
-	// We intentionally ignore things like the request closing and killing our
-	// context, because if we've made it this far we definitely want to persist
-	// the data.
-	ctx = context.WithoutCancel(ctx)
+	// Generic cache writes intentionally outlive request cancellation.
+	persistCtx := context.WithoutCancel(ctx)
+	if err := pg.set(persistCtx, key, val, ttl); err != nil {
+		Log(persistCtx).Error("problem setting cache", "err", err, "key", key)
+	}
+}
 
+func (pg *pgcache) set(ctx context.Context, key string, val []byte, ttl time.Duration) error {
 	expires := time.Now().Add(ttl)
 
 	buf := _buffers.Get()
@@ -133,15 +136,13 @@ func (pg *pgcache) Set(ctx context.Context, key string, val []byte, ttl time.Dur
 
 	err := compress(bytes.NewReader(val), buf)
 	if err != nil {
-		Log(ctx).Error("problem compressing value", "err", err, "key", key)
+		return fmt.Errorf("compressing value: %w", err)
 	}
 	_, err = pg.db.Exec(ctx,
 		`INSERT INTO cache (key, value, expires) VALUES ($1, $2, $3) ON CONFLICT (key) DO UPDATE SET value = $4, expires = $5;`,
 		key, buf.Bytes(), expires, buf.Bytes(), expires,
 	)
-	if err != nil {
-		Log(ctx).Error("problem setting cache", "err", err, "key", key)
-	}
+	return err
 }
 
 // Expire expires a row by setting its ttl to 0. The data is still persisted.

@@ -5,9 +5,11 @@ package internal
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"iter"
 	"net/http"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -182,6 +184,130 @@ func TestDenormalizeMissing(t *testing.T) {
 	assert.ErrorIs(t, err, errNotFound)
 }
 
+func TestShallowAuthorLookupDefersAndDeduplicatesCatalogueRefresh(t *testing.T) {
+	t.Parallel()
+
+	const (
+		authorID = int64(100)
+		workID   = int64(200)
+	)
+
+	getter := NewMockgetter(gomock.NewController(t))
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+	ctrl.refreshC = make(chan refreshAuthor, 2)
+
+	authorBytes, err := json.Marshal(AuthorResource{ForeignID: authorID})
+	require.NoError(t, err)
+	workBytes, err := json.Marshal(workResource{
+		ForeignID: workID,
+		Authors:   []AuthorResource{{ForeignID: authorID}},
+		Books:     []bookResource{{ForeignID: 300}},
+	})
+	require.NoError(t, err)
+
+	getter.EXPECT().GetAuthor(gomock.Any(), authorID).Return(authorBytes, nil)
+	getter.EXPECT().GetWork(gomock.Any(), workID, nil).Return(workBytes, authorID, nil)
+
+	// Denormalization needs the author record, but must not recursively crawl
+	// the author's complete catalogue.
+	require.NoError(t, ctrl.denormalizeWorks(t.Context(), authorID, workID))
+	assert.Len(t, ctrl.refreshC, 0)
+	_, refreshNeeded := ctrl.cache.Get(t.Context(), authorRefreshNeededKey(authorID))
+	assert.True(t, refreshNeeded)
+
+	// An explicit request schedules exactly one full refresh, even when it is
+	// repeated while that refresh is queued or running.
+	got, _, err := ctrl.GetAuthor(t.Context(), authorID)
+	require.NoError(t, err)
+	var gotAuthor AuthorResource
+	require.NoError(t, json.Unmarshal(got, &gotAuthor))
+	assert.Equal(t, authorID, gotAuthor.ForeignID)
+	assert.Len(t, ctrl.refreshC, 1)
+	_, refreshNeeded = ctrl.cache.Get(t.Context(), authorRefreshNeededKey(authorID))
+	assert.False(t, refreshNeeded)
+
+	_, _, err = ctrl.GetAuthor(t.Context(), authorID)
+	require.NoError(t, err)
+	assert.Len(t, ctrl.refreshC, 1)
+}
+
+func TestExplicitAuthorLookupWinsShallowSingleflightRace(t *testing.T) {
+	t.Parallel()
+
+	const authorID = int64(100)
+	getter := NewMockgetter(gomock.NewController(t))
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+	ctrl.refreshC = make(chan refreshAuthor, 2)
+
+	authorBytes, err := json.Marshal(AuthorResource{ForeignID: authorID})
+	require.NoError(t, err)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	getter.EXPECT().GetAuthor(gomock.Any(), authorID).DoAndReturn(func(context.Context, int64) ([]byte, error) {
+		close(started)
+		<-release
+		return authorBytes, nil
+	})
+
+	shallowDone := make(chan error, 1)
+	go func() {
+		_, _, err := ctrl.getAuthorForDenormalization(t.Context(), authorID)
+		shallowDone <- err
+	}()
+	<-started
+
+	explicitDone := make(chan error, 1)
+	go func() {
+		_, _, err := ctrl.GetAuthor(t.Context(), authorID)
+		explicitDone <- err
+	}()
+	close(release)
+
+	require.NoError(t, <-shallowDone)
+	require.NoError(t, <-explicitDone)
+	assert.Len(t, ctrl.refreshC, 1)
+}
+
+func TestShallowAuthorLookupJoiningExplicitSingleflightDoesNotDuplicateRefresh(t *testing.T) {
+	t.Parallel()
+
+	const authorID = int64(100)
+	getter := NewMockgetter(gomock.NewController(t))
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+	ctrl.refreshC = make(chan refreshAuthor, 2)
+
+	authorBytes, err := json.Marshal(AuthorResource{ForeignID: authorID})
+	require.NoError(t, err)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	getter.EXPECT().GetAuthor(gomock.Any(), authorID).DoAndReturn(func(context.Context, int64) ([]byte, error) {
+		close(started)
+		<-release
+		return authorBytes, nil
+	})
+
+	explicitDone := make(chan error, 1)
+	go func() {
+		_, _, err := ctrl.GetAuthor(t.Context(), authorID)
+		explicitDone <- err
+	}()
+	<-started
+
+	shallowDone := make(chan error, 1)
+	go func() {
+		_, _, err := ctrl.getAuthorForDenormalization(t.Context(), authorID)
+		shallowDone <- err
+	}()
+	close(release)
+
+	require.NoError(t, <-explicitDone)
+	require.NoError(t, <-shallowDone)
+	assert.Len(t, ctrl.refreshC, 1)
+}
+
 func TestSubtitles(t *testing.T) {
 	// Subtitles (i.e. FullTitle) are used in situations where multiple works
 	// share the same primary title, or when the work belongs to a series..
@@ -293,6 +419,7 @@ func TestSubtitles(t *testing.T) {
 
 	ctrl, err := NewController(cache, getter, nil, nil)
 	go ctrl.Run(t.Context())
+	t.Cleanup(func() { ctrl.Shutdown(context.Background()) })
 	require.NoError(t, err)
 
 	getter.EXPECT().GetAuthor(gomock.Any(), author.ForeignID).DoAndReturn(func(ctx context.Context, authorID int64) ([]byte, error) {
@@ -450,7 +577,10 @@ func TestMergedWorks(t *testing.T) {
 	cache := newMemoryCache()
 	ctrl, err := NewController(cache, getter, nil, nil)
 	require.NoError(t, err)
-	go ctrl.Run(t.Context())
+	// This test exercises synchronous denormalization only. Keep any explicit
+	// author refresh queued so asynchronous catalogue work cannot outlive the
+	// mock expectations for this test.
+	ctrl.refreshC = make(chan refreshAuthor, 1)
 
 	workID := int64(1)
 	mergedID := int64(2)
@@ -472,8 +602,6 @@ func TestMergedWorks(t *testing.T) {
 	getter.EXPECT().GetWork(gomock.Any(), mergedID, nil).Return(workBytes, authorID, nil)
 
 	getter.EXPECT().GetAuthor(gomock.Any(), authorID).Return(authorBytes, nil)
-	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).Return(nil)
-
 	err = ctrl.denormalizeWorks(ctx, authorID, workID, mergedID)
 	require.NoError(t, err)
 
@@ -487,36 +615,84 @@ func TestMergedWorks(t *testing.T) {
 	assert.Len(t, author.Works, 1)
 }
 
-func TestRefreshAuthorRetriesTransientFailures(t *testing.T) {
+func TestRefreshAuthorDoesNotMultiplyTransportRetries(t *testing.T) {
 	t.Parallel()
 
 	const (
 		authorID = int64(100)
 		bookID   = int64(200)
-		workID   = int64(300)
 	)
 
 	getter := NewMockgetter(gomock.NewController(t))
 	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
 	require.NoError(t, err)
-	ctrl.refreshRetryDelays = []time.Duration{0}
 	ctrl.denormC = make(chan edge, 10)
-
-	workBytes, err := json.Marshal(workResource{
-		ForeignID: workID,
-		Authors:   []AuthorResource{{ForeignID: authorID}},
-		Books:     []bookResource{{ForeignID: bookID}},
-	})
-	require.NoError(t, err)
 
 	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).Return(iter.Seq2[int64, error](func(yield func(int64, error) bool) {
 		yield(bookID, nil)
 	}))
-	getter.EXPECT().GetBook(gomock.Any(), bookID, gomock.Any()).Return(nil, int64(0), int64(0), statusErr(http.StatusTooManyRequests))
-	getter.EXPECT().GetBook(gomock.Any(), bookID, gomock.Any()).Return(workBytes, int64(0), int64(0), nil)
-	getter.EXPECT().GetWork(gomock.Any(), workID, gomock.Any()).Return(workBytes, int64(0), nil)
+	// The GraphQL batcher/transport owns bounded physical retries. The
+	// controller must make exactly one logical call and defer the whole author
+	// attempt after that owner reports failure.
+	getter.EXPECT().GetBook(gomock.Any(), bookID, gomock.Any()).Return(nil, int64(0), int64(0), statusErr(http.StatusServiceUnavailable))
 
-	assert.True(t, ctrl.refreshAuthorOnce(t.Context(), authorID))
+	complete, cause := ctrl.refreshAuthorAttempt(t.Context(), authorID)
+	assert.False(t, complete)
+	assert.ErrorIs(t, cause, statusErr(http.StatusServiceUnavailable))
+}
+
+func TestRefreshAuthorStopsImmediatelyOnRateLimit(t *testing.T) {
+	t.Parallel()
+
+	const (
+		authorID   = int64(100)
+		firstBook  = int64(200)
+		secondBook = int64(201)
+	)
+
+	getter := NewMockgetter(gomock.NewController(t))
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+	ctrl.denormC = make(chan edge, 1)
+
+	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).Return(iter.Seq2[int64, error](func(yield func(int64, error) bool) {
+		if !yield(firstBook, nil) {
+			return
+		}
+		yield(secondBook, nil)
+	}))
+	// There is intentionally no expectation for a retry or for secondBook.
+	getter.EXPECT().GetBook(gomock.Any(), firstBook, gomock.Any()).Return(nil, int64(0), int64(0), statusErr(http.StatusTooManyRequests))
+
+	complete, cause := ctrl.refreshAuthorAttempt(t.Context(), authorID)
+	assert.False(t, complete)
+	assert.ErrorIs(t, cause, statusErr(http.StatusTooManyRequests))
+	assert.Empty(t, ctrl.denormC)
+}
+
+func TestRefreshAuthorPropagatesRateLimitDeadlineAfterEarlierFailure(t *testing.T) {
+	t.Parallel()
+
+	const authorID = int64(100)
+	getter := NewMockgetter(gomock.NewController(t))
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+	ctrl.denormC = make(chan edge, 1)
+
+	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).Return(iter.Seq2[int64, error](func(yield func(int64, error) bool) {
+		if yield(200, nil) {
+			yield(201, nil)
+		}
+	}))
+	getter.EXPECT().GetBook(gomock.Any(), int64(200), gomock.Any()).Return(nil, int64(0), int64(0), statusErr(http.StatusServiceUnavailable))
+	deadline := time.Now().Add(time.Hour)
+	getter.EXPECT().GetBook(gomock.Any(), int64(201), gomock.Any()).Return(nil, int64(0), int64(0), &RateLimitError{Until: deadline})
+
+	complete, cause := ctrl.refreshAuthorAttempt(t.Context(), authorID)
+	assert.False(t, complete)
+	var rateLimit *RateLimitError
+	require.ErrorAs(t, cause, &rateLimit)
+	assert.Equal(t, deadline, rateLimit.Until)
 }
 
 func TestRefreshAuthorKeepsFailedEnumerationPending(t *testing.T) {
@@ -527,7 +703,6 @@ func TestRefreshAuthorKeepsFailedEnumerationPending(t *testing.T) {
 	getter := NewMockgetter(gomock.NewController(t))
 	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
 	require.NoError(t, err)
-	ctrl.refreshRetryDelays = nil
 	ctrl.denormC = make(chan edge, 1)
 
 	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).Return(iter.Seq2[int64, error](func(yield func(int64, error) bool) {
@@ -536,6 +711,324 @@ func TestRefreshAuthorKeepsFailedEnumerationPending(t *testing.T) {
 
 	assert.False(t, ctrl.refreshAuthorOnce(t.Context(), authorID))
 	assert.Empty(t, ctrl.denormC)
+}
+
+func TestAuthorRefreshRateLimitPlanPreservesBudgetAndDeadline(t *testing.T) {
+	t.Parallel()
+
+	ctrl, err := NewController(newMemoryCache(), NewMockgetter(gomock.NewController(t)), nil, nil)
+	require.NoError(t, err)
+	ctrl.authorRefreshRetryDelay = time.Second
+
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	cause := &RateLimitError{Until: now.Add(45 * time.Minute), now: func() time.Time { return now }}
+	nextAttempt, delay := ctrl.authorRefreshRetryPlan(refreshAuthor{attempt: 3}, cause)
+	assert.Equal(t, 3, nextAttempt, "a provider cooldown must not consume author retry budget")
+	assert.Equal(t, 45*time.Minute, delay)
+}
+
+func TestAuthorRefreshRateLimitRetryDoesNotWakeBeforeCooldown(t *testing.T) {
+	ctrl, err := NewController(newMemoryCache(), NewMockgetter(gomock.NewController(t)), nil, nil)
+	require.NoError(t, err)
+	ctrl.authorRefreshRetryDelay = time.Millisecond
+	ctrl.refreshC = make(chan refreshAuthor, 1)
+
+	const cooldown = 50 * time.Millisecond
+	start := time.Now()
+	cause := &RateLimitError{Until: start.Add(cooldown)}
+	ctrl.scheduleAuthorRefreshRetry(t.Context(), refreshAuthor{id: 100, attempt: 2}, cause)
+
+	select {
+	case retry := <-ctrl.refreshC:
+		assert.Equal(t, 2, retry.attempt)
+		assert.GreaterOrEqual(t, time.Since(start), cooldown-5*time.Millisecond)
+	case <-time.After(time.Second):
+		t.Fatal("rate-limited author refresh was not rescheduled")
+	}
+}
+
+func TestAuthorRefreshBackoffIsExponentialAndCapped(t *testing.T) {
+	t.Parallel()
+
+	ctrl, err := NewController(newMemoryCache(), NewMockgetter(gomock.NewController(t)), nil, nil)
+	require.NoError(t, err)
+	ctrl.authorRefreshRetryDelay = time.Minute
+	ctrl.authorRefreshRetryMax = 8 * time.Minute
+
+	assert.Equal(t, time.Minute, ctrl.authorRefreshBackoff(0))
+	assert.Equal(t, 2*time.Minute, ctrl.authorRefreshBackoff(1))
+	assert.Equal(t, 4*time.Minute, ctrl.authorRefreshBackoff(2))
+	assert.Equal(t, 8*time.Minute, ctrl.authorRefreshBackoff(3))
+	assert.Equal(t, 8*time.Minute, ctrl.authorRefreshBackoff(100))
+}
+
+func TestAuthorRefreshPausesAfterBoundedAttempts(t *testing.T) {
+	const authorID = int64(100)
+	cache := newMemoryCache()
+	ctrl, err := NewController(cache, NewMockgetter(gomock.NewController(t)), nil, nil)
+	require.NoError(t, err)
+	ctrl.authorRefreshMaxAttempts = 1
+	require.True(t, ctrl.claimAuthorRefresh(authorID))
+	ctrl.metrics.refreshWaitingAdd(1)
+
+	ctrl.scheduleAuthorRefreshRetry(t.Context(), refreshAuthor{id: authorID}, errors.New("incomplete catalogue"))
+
+	_, markerExists := cache.Get(t.Context(), authorRefreshNeededKey(authorID))
+	assert.True(t, markerExists)
+	assert.True(t, ctrl.claimAuthorRefresh(authorID), "paused refresh must be manually resumable")
+	assert.Equal(t, float64(0), ctrl.metrics.refreshWaitingGet())
+}
+
+type recordingPersister struct {
+	mu      sync.Mutex
+	pending map[int64][]byte
+}
+
+func (p *recordingPersister) Persist(_ context.Context, authorID int64, state []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pending == nil {
+		p.pending = make(map[int64][]byte)
+	}
+	p.pending[authorID] = append([]byte(nil), state...)
+	return nil
+}
+
+func (p *recordingPersister) Persisted(context.Context) ([]int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ids := make([]int64, 0, len(p.pending))
+	for id := range p.pending {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func (p *recordingPersister) Delete(_ context.Context, authorID int64) error {
+	p.mu.Lock()
+	delete(p.pending, authorID)
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *recordingPersister) has(authorID int64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.pending[authorID]
+	return ok
+}
+
+func TestShutdownDrainsRefreshCompletionBeforeRunStops(t *testing.T) {
+	const authorID = int64(100)
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	getter := NewMockgetter(gomock.NewController(t))
+	getter.EXPECT().GetAuthorBooks(gomock.Any(), authorID).Return(iter.Seq2[int64, error](func(yield func(int64, error) bool) {
+		close(started)
+		<-release
+	}))
+
+	persist := &recordingPersister{}
+	cache := newMemoryCache()
+	ctrl, err := NewController(cache, getter, persist, nil)
+	require.NoError(t, err)
+	go ctrl.Run(context.Background())
+	select {
+	case <-ctrl.runReady:
+	case <-time.After(time.Second):
+		t.Fatal("controller did not start")
+	}
+
+	cache.Set(t.Context(), authorRefreshNeededKey(authorID), []byte{1}, time.Hour)
+	ctrl.queueAuthorRefreshIfNeeded(t.Context(), authorID, []byte(`{"id":100}`))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("author refresh did not start")
+	}
+	require.True(t, persist.has(authorID))
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	shutdownDone := make(chan struct{})
+	go func() {
+		ctrl.Shutdown(shutdownCtx)
+		close(shutdownDone)
+	}()
+
+	// Shutdown must leave Run consuming denormalization edges while the active
+	// refresh finishes and submits refreshDone.
+	close(release)
+	select {
+	case <-shutdownDone:
+	case <-shutdownCtx.Done():
+		t.Fatal("shutdown left an author refresh blocked")
+	}
+
+	assert.False(t, persist.has(authorID), "completed refresh must not remain persisted across deploy")
+	assert.True(t, ctrl.claimAuthorRefresh(authorID), "refresh claim must be released after persistence cleanup")
+}
+
+func TestShutdownDrainsWorkSpawnedWhileProcessingAuthorEdge(t *testing.T) {
+	const (
+		authorID = int64(100)
+		workID   = int64(200)
+		bookID   = int64(300)
+	)
+	authorHeld := make(chan struct{})
+	releaseAuthor := make(chan struct{})
+	workStarted := make(chan struct{})
+	releaseWork := make(chan struct{})
+	bookProcessed := make(chan struct{})
+
+	getter := NewMockgetter(gomock.NewController(t))
+	cache := newMemoryCache()
+	var ctrl *Controller
+
+	authorBytes, err := json.Marshal(AuthorResource{ForeignID: authorID})
+	require.NoError(t, err)
+	cache.Set(t.Context(), AuthorKey(authorID), authorBytes, time.Hour)
+	work := workResource{ForeignID: workID, Books: []bookResource{{ForeignID: bookID}}}
+	workBytes, err := json.Marshal(work)
+	require.NoError(t, err)
+
+	firstWork := getter.EXPECT().GetWork(gomock.Any(), workID, nil).DoAndReturn(func(context.Context, int64, editionsCallback) ([]byte, int64, error) {
+		close(authorHeld)
+		<-releaseAuthor
+		ctrl.workG.Go(func() error {
+			close(workStarted)
+			<-releaseWork
+			_ = ctrl.enqueueDenorm(context.Background(), edge{kind: workEdge, parentID: workID, childIDs: newSet(bookID)})
+			return nil
+		})
+		return workBytes, authorID, nil
+	})
+	secondWork := getter.EXPECT().GetWork(gomock.Any(), workID, nil).After(firstWork.Call).Return(workBytes, authorID, nil)
+	getter.EXPECT().GetBook(gomock.Any(), bookID, nil).After(secondWork).DoAndReturn(func(context.Context, int64, editionsCallback) ([]byte, int64, int64, error) {
+		close(bookProcessed)
+		return workBytes, workID, authorID, nil
+	})
+
+	ctrl, err = NewController(cache, getter, nil, nil)
+	require.NoError(t, err)
+	go ctrl.Run(context.Background())
+	select {
+	case <-ctrl.runReady:
+	case <-time.After(time.Second):
+		t.Fatal("controller did not start")
+	}
+
+	ctrl.denormC <- edge{kind: authorEdge, parentID: authorID, childIDs: newSet(workID)}
+	select {
+	case <-authorHeld:
+	case <-time.After(time.Second):
+		t.Fatal("author edge was not being processed")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	shutdownDone := make(chan struct{})
+	go func() {
+		ctrl.Shutdown(shutdownCtx)
+		close(shutdownDone)
+	}()
+	close(releaseAuthor)
+	select {
+	case <-workStarted:
+	case <-time.After(time.Second):
+		t.Fatal("author edge did not spawn bounded work")
+	}
+	select {
+	case <-shutdownDone:
+		t.Fatal("shutdown returned before spawned work completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(releaseWork)
+	select {
+	case <-shutdownDone:
+	case <-shutdownCtx.Done():
+		t.Fatal("shutdown did not finish")
+	}
+	select {
+	case <-bookProcessed:
+	default:
+		t.Fatal("work edge submitted during shutdown was not drained")
+	}
+}
+
+func TestShutdownWaitsForAdmittedDenormProducer(t *testing.T) {
+	ctrl, err := NewController(newMemoryCache(), NewMockgetter(gomock.NewController(t)), nil, nil)
+	require.NoError(t, err)
+	go ctrl.Run(context.Background())
+	<-ctrl.runReady
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	ctrl.submitDenormTask(func() {
+		close(started)
+		<-release
+		_ = ctrl.enqueueDenorm(context.Background(), edge{kind: authorEdge, parentID: 4699102})
+	})
+	<-started
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		ctrl.Shutdown(shutdownCtx)
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("shutdown returned before admitted producer finished")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-shutdownCtx.Done():
+		t.Fatal("shutdown did not drain admitted producer")
+	}
+}
+
+func TestRecommendationsWaitsForHydration(t *testing.T) {
+	const workID = int64(100)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	getter := NewMockgetter(gomock.NewController(t))
+	getter.EXPECT().Recommendations(gomock.Any(), int64(1)).Return(RecommentationsResource{WorkIDs: []int64{workID}}, nil)
+	workBytes, err := json.Marshal(workResource{ForeignID: workID})
+	require.NoError(t, err)
+	getter.EXPECT().GetWork(gomock.Any(), workID, gomock.Any()).DoAndReturn(func(context.Context, int64, editionsCallback) ([]byte, int64, error) {
+		close(started)
+		<-release
+		return workBytes, int64(0), nil
+	})
+	ctrl, err := NewController(newMemoryCache(), getter, nil, nil)
+	require.NoError(t, err)
+	ctrl.denormC = make(chan edge, 1)
+
+	type result struct {
+		recs RecommentationsResource
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		recs, recommendationErr := ctrl.Recommendations(t.Context(), 1)
+		done <- result{recs: recs, err: recommendationErr}
+	}()
+	<-started
+	select {
+	case <-done:
+		t.Fatal("recommendations returned before hydration completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	got := <-done
+	require.NoError(t, got.err)
+	assert.Equal(t, []int64{workID}, got.recs.WorkIDs)
 }
 
 func TestFuzz(t *testing.T) {

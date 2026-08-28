@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -15,6 +16,31 @@ func TestErrorReturnsRateLimitStatusAndRetryAfter(t *testing.T) {
 
 	assert.Equal(t, http.StatusTooManyRequests, recorder.Code)
 	assert.Equal(t, "30", recorder.Header().Get("Retry-After"))
+}
+
+func TestErrorPreservesDynamicRateLimitDeadline(t *testing.T) {
+	now := time.Date(2026, time.August, 27, 12, 0, 0, 0, time.UTC)
+	err := &RateLimitError{
+		Until: now.Add(93 * time.Second),
+		now:   func() time.Time { return now },
+	}
+	recorder := httptest.NewRecorder()
+	(&Handler{}).error(recorder, err)
+
+	assert.Equal(t, http.StatusTooManyRequests, recorder.Code)
+	assert.Equal(t, "93", recorder.Header().Get("Retry-After"))
+}
+
+func TestErrorReturnsRetryAfterForLocalOverload(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	(&Handler{}).error(recorder, &BackoffError{
+		Code:    http.StatusServiceUnavailable,
+		Delay:   45 * time.Second,
+		Message: "queue full",
+	})
+
+	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+	assert.Equal(t, "45", recorder.Header().Get("Retry-After"))
 }
 
 func TestPathToID(t *testing.T) {

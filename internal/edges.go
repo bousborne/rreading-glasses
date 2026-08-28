@@ -6,6 +6,7 @@ const (
 	authorEdge  edgeKind = 1
 	workEdge    edgeKind = 2
 	refreshDone edgeKind = 3
+	drainEdge   edgeKind = 4
 )
 
 // edge represents a parent/child relationship. They are used for denormalizing
@@ -14,4 +15,5 @@ type edge struct {
 	kind     edgeKind
 	parentID int64
 	childIDs set[int64]
+	done     chan struct{}
 }

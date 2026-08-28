@@ -52,3 +52,15 @@ func (c *memoryCache) Expire(_ context.Context, key string) error {
 func (c *memoryCache) Delete(ctx context.Context, key string) error {
 	return c.Expire(ctx, key)
 }
+
+// PersistRateLimitState and DeleteRateLimitState let the in-memory cache act
+// as a deterministic RateLimitStateStore in tests. Production uses the
+// LayeredCache implementation, which requires a successful Postgres write.
+func (c *memoryCache) PersistRateLimitState(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	c.Set(ctx, key, value, ttl)
+	return nil
+}
+
+func (c *memoryCache) DeleteRateLimitState(ctx context.Context, key string) error {
+	return c.Delete(ctx, key)
+}

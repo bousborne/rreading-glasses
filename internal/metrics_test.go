@@ -5,8 +5,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -66,6 +68,25 @@ func TestControllerMetrics(t *testing.T) {
 	assert.Equal(t, 1.0, cm.etagMismatchesGet())
 }
 
+func TestPendingOperationGaugesUseGaugeValues(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	gql := newGQLMetrics(reg)
+	gql.batchesWaitingSet(7)
+	gql.queriesWaitingSet(13)
+	gql.cooldownSecondsSet(90 * time.Second)
+	assert.Equal(t, 7, gql.batchesWaitingGet())
+	metric := &dto.Metric{}
+	require.NoError(t, gql.gauge.WithLabelValues("queries").Write(metric))
+	assert.Equal(t, float64(13), metric.GetGauge().GetValue())
+	metric = &dto.Metric{}
+	require.NoError(t, gql.gauge.WithLabelValues("cooldown_seconds").Write(metric))
+	assert.Equal(t, float64(90), metric.GetGauge().GetValue())
+
+	cloudflare := newCloudflareMetrics(reg)
+	cloudflare.batchesWaitingSet(11)
+	assert.Equal(t, 11, cloudflare.batchesWaitingGet())
+}
+
 func TestCacheMetrics(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	cm := newCacheMetrics(reg)
@@ -81,4 +102,11 @@ func TestCacheMetrics(t *testing.T) {
 func TestNormalizePattern(t *testing.T) {
 	assert.Equal(t, "/author", normalizePattern("/author/{foreignAuthorID}"))
 	assert.Equal(t, "/book/bulk", normalizePattern("/book/bulk/"))
+}
+
+func TestCacheStatsQueryExcludesAuthorRefreshMarkers(t *testing.T) {
+	assert.Contains(t, cacheStatsQuery, "key >= 'a0' AND key < 'a:'")
+	assert.NotContains(t, cacheStatsQuery, "key LIKE 'a%'")
+	assert.Contains(t, cacheStatsQuery, "key >= 'ra0' AND key < 'ra:'")
+	assert.NotContains(t, cacheStatsQuery, "key LIKE 'ra%'")
 }
